@@ -344,6 +344,7 @@ public:
                 NIXL_ERROR << "Watch timed out for key: " << metadata_key;
                 return NIXL_ERR_BACKEND;
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             watcher.Cancel();
             return future.get();
 
