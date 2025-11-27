@@ -116,12 +116,14 @@ void Buffer::update_memory_buffers(int num_ranks, int64_t num_rdma_bytes)
     }
 }
 
-Buffer::Buffer(int rank, bool explicitly_destroy, bool enable_shrink):
+Buffer::Buffer(int rank, bool explicitly_destroy, bool enable_shrink,
+               const std::string& discovery_mode):
         rank(rank), num_ranks(1),
         explicitly_destroy(explicitly_destroy),
         comm_stream(at::cuda::getStreamFromPool(true)),
         dummy_src_dlist(VRAM_SEG),
-        enable_shrink(enable_shrink) {}
+        enable_shrink(enable_shrink),
+        discovery_mode(discovery_mode) {}
 
 void Buffer::init(int num_ranks, int64_t num_rdma_bytes)
 {
@@ -257,7 +259,7 @@ void Buffer::barrier() {
     ep_kernels::barrier(nixl_ctx->gpu[0],mask_buffer_ptr, sync_buffer_ptr, compute_stream);
 }
 
-void Buffer::_nixl_agents_connect(const std::vector<int>& ranks) {
+void Buffer::_nixl_agents_connect(const std::vector<int>& ranks, const std::vector<std::string>& rank_ips) {
     EP_HOST_ASSERT(!ranks.empty());
 
     // Assuming ranks vector does not include current rank and has only new ranks
@@ -266,8 +268,22 @@ void Buffer::_nixl_agents_connect(const std::vector<int>& ranks) {
         nixl_agent_info->remote_agent_names[remote_rank] = std::to_string(remote_rank);
     }
 
-    for (int remote_rank : ranks) {
-        nixl_status_t fetch_status = nixl_agent_info->agent->fetchRemoteMD(nixl_agent_info->remote_agent_names[remote_rank]);
+    for (size_t i = 0; i < ranks.size(); ++i) {
+        int remote_rank = ranks[i];
+        nixl_opt_args_t extra_params;
+        nixl_opt_args_t* extra_params_ptr = nullptr;
+
+        if (discovery_mode == "tcp") {
+            if (i >= rank_ips.size() || rank_ips[i].empty()) {
+                throw std::runtime_error("IP address not provided for rank " + std::to_string(remote_rank) +
+                                        " in TCP discovery mode");
+            }
+            extra_params.ipAddr = rank_ips[i];
+            extra_params.port = 8888 + remote_rank;
+            extra_params_ptr = &extra_params;
+        }
+
+        nixl_status_t fetch_status = nixl_agent_info->agent->fetchRemoteMD(nixl_agent_info->remote_agent_names[remote_rank], extra_params_ptr);
         if (fetch_status != NIXL_SUCCESS) {
             throw std::runtime_error("Failed to fetch metadata for remote agent " + std::to_string(remote_rank) +
                                     ", status: " + std::to_string(fetch_status));
@@ -334,18 +350,22 @@ void Buffer::_nixl_ep_barrier_buffer_clear() {
     CUDA_CHECK(cudaMemset(sync_buffer_ptr, 0, max_num_ranks * sizeof(int)));
 }
 
-void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list) {
+void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std::vector<std::string>& rank_ips) {
     EP_HOST_ASSERT(!remote_ranks_list.empty());
+    EP_HOST_ASSERT(discovery_mode != "tcp" || rank_ips.size() == remote_ranks_list.size());
     std::vector<int> new_ranks;
+    std::vector<std::string> new_rank_ips;
     int max_added_rank = std::max(rank, *std::max_element(remote_ranks_list.begin(), remote_ranks_list.end()));
     num_ranks = std::max(num_ranks, max_added_rank + 1);
 
-    for (int remote_rank : remote_ranks_list) {
+    for (size_t i = 0; i < remote_ranks_list.size(); ++i) {
+        int remote_rank = remote_ranks_list[i];
         // Skip self and ranks we are already connected to
         if (remote_rank == rank or std::find(remote_ranks.begin(), remote_ranks.end(), remote_rank) != remote_ranks.end())
             continue;
 
         new_ranks.push_back(remote_rank);
+        if (discovery_mode == "tcp") new_rank_ips.push_back(rank_ips[i]);
         CUDA_CHECK(cudaMemset(mask_buffer_ptr + remote_rank, 0, sizeof(int))); // Reset mask buffer for new ranks
     }
 
@@ -354,7 +374,7 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list) {
 
     _nixl_ep_barrier_buffer_clear();
 
-    _nixl_agents_connect(new_ranks);
+    _nixl_agents_connect(new_ranks, new_rank_ips);
 
     _nixl_agents_peer_info_gather(new_ranks);
 
@@ -755,7 +775,8 @@ void Buffer::_nixl_ep_init(const std::vector<int>& ranks) {
 
 void Buffer::_nixl_agent_init() {
     std::string agent_name = std::to_string(rank);
-    nixlAgentConfig cfg(true, false, 0,
+    int listen_port = (discovery_mode == "tcp") ? (8888 + rank) : 0;
+    nixlAgentConfig cfg(true, listen_port != 0, listen_port,
                         nixl_thread_sync_t::NIXL_THREAD_SYNC_RW, 1, 0, 100000, false, NIXL_ETCD_WATCH_TIMEOUT);
     auto agent = std::make_shared<nixlAgent>(agent_name, cfg);
 
@@ -811,11 +832,12 @@ void Buffer::_nixl_agent_init() {
     wireup_dlist.addDesc(nixlBlobDesc((uintptr_t)(wireup_buffer_ptr), sizeof(uint64_t), get_local_device_id(), ""));
     EP_HOST_ASSERT(agent->registerMem(wireup_dlist) == NIXL_SUCCESS);
 
-    // Send local metadata
-    status = nixl_agent_info->agent->sendLocalMD();
-    if (status != NIXL_SUCCESS) {
-        throw std::runtime_error("Failed to send local metadata for agent " +
-                                nixl_agent_info->agent_name + ", status: " + std::to_string(status));
+    if (discovery_mode == "etcd") {
+        status = nixl_agent_info->agent->sendLocalMD();
+        if (status != NIXL_SUCCESS) {
+            throw std::runtime_error("Failed to send local metadata for agent " +
+                                    nixl_agent_info->agent_name + ", status: " + std::to_string(status));
+        }
     }
 }
 
@@ -1032,10 +1054,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("current_stream_wait", &nixl_ep::EventHandle::current_stream_wait);
 
     pybind11::class_<nixl_ep::Buffer>(m, "Buffer")
-        .def(pybind11::init<int, bool, bool>())
+        .def(pybind11::init<int, bool, bool, const std::string&>(),
+             py::arg("rank"), py::arg("explicitly_destroy"), py::arg("enable_shrink"),
+             py::arg("discovery_mode") = "etcd")
         .def("update_memory_buffers", &nixl_ep::Buffer::update_memory_buffers)
         .def("barrier", &nixl_ep::Buffer::barrier)
-        .def("connect_ranks", &nixl_ep::Buffer::connect_ranks, py::arg("remote_ranks"))
+        .def("connect_ranks", &nixl_ep::Buffer::connect_ranks, py::arg("remote_ranks"), py::arg("rank_ips") = std::vector<std::string>())
         .def("disconnect_ranks", &nixl_ep::Buffer::disconnect_ranks)
         .def("is_available", &nixl_ep::Buffer::is_available)
         .def("get_local_device_id", &nixl_ep::Buffer::get_local_device_id)

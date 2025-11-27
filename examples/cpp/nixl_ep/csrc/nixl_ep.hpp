@@ -138,10 +138,11 @@ private:
     int env_num_channels;
     nixl_xfer_dlist_t dummy_src_dlist; // TODO: Remove once NIXL supports null src dlist for signals
     std::unique_ptr<nixl_ep_ctx> nixl_ctx = nullptr;
+    std::string discovery_mode; // "etcd" or "tcp"
 
     /* Common private funcs */
     void _nixl_agent_init();
-    void _nixl_agents_connect(const std::vector<int>& ranks);
+    void _nixl_agents_connect(const std::vector<int>& ranks, const std::vector<std::string>& rank_ips = {});
     void _nixl_agents_disconnect(const std::vector<int>& ranks);
     void _nixl_agents_peer_info_gather(std::vector<int>& ranks);
     void _nixl_agents_peer_info_cleanup(const std::vector<int>& ranks);
@@ -163,11 +164,12 @@ private:
     void _nixl_ep_barrier_buffer_clear();
 
 public:
-    Buffer(int rank, bool explicitly_destroy, bool enable_shrink);
+    Buffer(int rank, bool explicitly_destroy, bool enable_shrink,
+           const std::string& discovery_mode = "etcd");
 
     void update_memory_buffers(int num_ranks, int64_t num_rdma_bytes);
 
-    void connect_ranks(const std::vector<int>& remote_ranks_list);
+    void connect_ranks(const std::vector<int>& remote_ranks_list, const std::vector<std::string>& rank_ips = {});
 
     void disconnect_ranks(const std::vector<int>& remote_ranks_list);
 

@@ -47,7 +47,8 @@ class Buffer:
 
     def __init__(self, nvlink_backend: Literal['nixl', 'ipc', 'none'] = 'nixl',
                  explicitly_destroy: bool = False, rank: int = 0, enable_shrink: bool = False,
-                 group: Optional[dist.ProcessGroup] = None, comm: Optional["mpi4py.MPI.Comm"] = None) -> None:
+                 group: Optional[dist.ProcessGroup] = None, comm: Optional["mpi4py.MPI.Comm"] = None,
+                 discovery_mode: Literal['etcd', 'tcp'] = 'etcd') -> None:
         """
         Initialize the nixl communication buffer.
 
@@ -59,20 +60,27 @@ class Buffer:
             rank: the rank number.
             group: the communication group (optional).
             comm: the mpi4py.MPI.Comm communicator to use in case the group parameter is absent (optional).
+            discovery_mode: discovery mode to use, either 'etcd' (default) or 'tcp' for TCP P2P discovery.
+                           In TCP mode, each rank listens on port (8888 + rank) for metadata exchange.
         """
         self.rank = rank
         self.group_size = 0  # Will be updated by `update_memory_buffers`
         self.explicitly_destroy = explicitly_destroy
         self.group = group
         self.comm = comm
+        self.discovery_mode = discovery_mode
         assert not (group and comm)
+
+        # Validate discovery mode
+        if discovery_mode not in ('etcd', 'tcp'):
+            raise ValueError(f"discovery_mode must be either 'etcd' or 'tcp', got '{discovery_mode}'")
 
         # Configure NVLINK backend
         os.environ['NIXL_EP_NVLINK_BACKEND_IPC'] = '1' if nvlink_backend == 'ipc' else '0'
         if nvlink_backend != 'nixl':
             os.environ["UCX_TLS"] = "^cuda_ipc"
 
-        self.runtime = nixl_ep_cpp.Buffer(self.rank, explicitly_destroy, enable_shrink)
+        self.runtime = nixl_ep_cpp.Buffer(self.rank, explicitly_destroy, enable_shrink, discovery_mode)
 
     def destroy(self):
         """
@@ -347,15 +355,20 @@ class Buffer:
         os.environ['NIXL_EP_NUM_CHANNELS'] = str(num_experts_per_rank)
         self.runtime.update_memory_buffers(num_ranks, num_rdma_bytes)
 
-    def connect_ranks(self, remote_ranks: List[int]) -> None:
+    def connect_ranks(self, remote_ranks: List[int], ips: Optional[List[str]] = []) -> None:
         """
         Add connections to remote ranks.
 
         Arguments:
             remote_ranks: List of remote rank IDs to establish connections with.
                          The current rank will be automatically filtered out.
+            ips: List of IP addresses corresponding to remote_ranks. Required when discovery_mode='tcp',
+                 where ips[i] is the IP address for remote_ranks[i]. Ignored when discovery_mode='etcd'.
         """
-        self.runtime.connect_ranks(remote_ranks)
+        if self.discovery_mode == 'tcp' and len(ips) != len(remote_ranks):
+            raise ValueError(f"Length of ips ({len(ips)}) must match length of remote_ranks ({len(remote_ranks)})")
+
+        self.runtime.connect_ranks(remote_ranks, ips)
 
     def disconnect_ranks(self, remote_ranks: List[int]) -> None:
         """
