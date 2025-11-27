@@ -29,6 +29,7 @@ class RankServerHandler(StreamRequestHandler):
     _global: int = 0
     _lock: Lock = Lock()
     _rank_to_host: dict[int, tuple[str, int]] = {}  # Maps global rank to (host, local_rank)
+    _rank_to_ip: dict[int, str] = {}  # Maps global rank to IP address
     _user_context: dict[str, str | None] = {}
     _all_global_ranks: set[int] = set()
     _removed_global_ranks: set[int] = set()
@@ -53,12 +54,22 @@ class RankServerHandler(StreamRequestHandler):
                             self._counts[host].remove(local_rank)
                         # Remove the mapping
                         del self._rank_to_host[rank_to_release]
+                    if rank_to_release in self._rank_to_ip:
+                        del self._rank_to_ip[rank_to_release]
                     self.wfile.write("OK\n".encode())
                 else:
                     self.wfile.write("ERROR: No ranks to release\n".encode())
+            elif line.startswith("GET_RANK_IP"):
+                rank = int(line.split()[1])
+                if rank in self._rank_to_ip:
+                    self.wfile.write(f"{self._rank_to_ip[rank]}\n".encode())
+                else:
+                    self.wfile.write("ERROR: Rank not found\n".encode())
             else:
                 # Handle rank assignment - find lowest unused local rank
-                host = line
+                parts = line.split()
+                host = parts[0]
+                ip = parts[1] if len(parts) > 1 else None
                 # Find the lowest unused local rank for this host
                 used_ranks = set(self._counts[host])
                 local = 0
@@ -76,6 +87,8 @@ class RankServerHandler(StreamRequestHandler):
                 self._all_global_ranks.add(global_rank)
                 # Record which host and local rank this global rank maps to
                 self._rank_to_host[global_rank] = (host, local)
+                if ip:
+                    self._rank_to_ip[global_rank] = ip
                 if str(global_rank) not in self._user_context:
                     self._user_context[str(global_rank)] = None
                 self.wfile.write(f"{local} {global_rank} {self._user_context[str(global_rank)]}\n".encode()) if self._user_context[str(global_rank)] is not None else self.wfile.write(f"{local} {global_rank}\n".encode())
@@ -114,8 +127,10 @@ class RankClient:
         if self.self_global_rank is not None:
             print(f"WARNING: rank already assigned - returning existing rank {self.self_global_rank}", flush=True)
             return self.self_global_rank
+        import subprocess
+        ip = subprocess.check_output(['hostname', '-i']).decode().strip()
         s = socket.create_connection((self.server, self.port))
-        s.sendall(f"{os.uname().nodename}\n".encode())
+        s.sendall(f"{os.uname().nodename} {ip}\n".encode())
         server_response = s.recv(1024).decode().split()
         if len(server_response) == 2:
             local_rank, global_rank = tuple(map(int, server_response))
@@ -125,6 +140,15 @@ class RankClient:
         s.close()
         self.self_global_rank = global_rank
         return local_rank, global_rank, user_context
+
+    def get_rank_ip(self, rank: int) -> str:
+        s = socket.create_connection((self.server, self.port))
+        s.sendall(f"GET_RANK_IP {rank}\n".encode())
+        response = s.recv(1024).decode().strip()
+        s.close()
+        if response.startswith("ERROR"):
+            raise ValueError(f"Failed to get IP for rank {rank}: {response}")
+        return response
 
     def release_rank(self, user_context: str | None = None) -> bool:
         """Release a rank (decrement the global counter by 1)"""

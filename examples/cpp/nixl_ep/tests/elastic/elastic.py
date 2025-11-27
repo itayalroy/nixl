@@ -279,15 +279,12 @@ def worker(torch_rank: int, args: argparse.Namespace):
     tcp_nics = ',ibp154s0,ibp192s0,ibp206s0,ibp220s0,ibp94s0'
     os.environ['UCX_NET_DEVICES'] = f'cuda0-{pxb_nics[local_rank]}:1' + tcp_nics
 
-    # Initialize NIXL
-    os.environ['NIXL_ETCD_ENDPOINTS'] = args.etcd_server
-
     # Initialize nixl_ep buffer
     num_rdma_bytes = nixl_ep.Buffer.get_rdma_size_hint(args.num_tokens, args.hidden_dim, max_num_ranks, args.num_experts_per_rank * max_num_ranks)
     if local_rank == 0:
         print(f'Allocating buffer size: {num_rdma_bytes / 1e6} MB ...', flush=True)
 
-    buffer = nixl_ep.Buffer(rank=global_rank, nvlink_backend=args.nvlink_backend, explicitly_destroy=True, enable_shrink=True)
+    buffer = nixl_ep.Buffer(rank=global_rank, nvlink_backend=args.nvlink_backend, explicitly_destroy=True, enable_shrink=True, discovery_mode='tcp')
     buffer.update_memory_buffers(num_ranks=max_num_ranks, num_experts_per_rank=args.num_experts_per_rank, num_rdma_bytes=num_rdma_bytes)
     signal.signal(signal.SIGTERM, partial(handle_sigterm, buffer=buffer, plan=plan, rank_client=rank_client))
     remote_ranks = set()
@@ -308,7 +305,8 @@ def worker(torch_rank: int, args: argparse.Namespace):
 
         if len(added_ranks) > 0:
             print(f"global_rank={global_rank}, local_rank={local_rank} -> adding connections to {added_ranks}", flush=True)
-            buffer.connect_ranks(added_ranks)
+            rank_ips = [rank_client.get_rank_ip(r) for r in added_ranks]
+            buffer.connect_ranks(added_ranks, ips=rank_ips)
             remote_ranks.update(added_ranks)
 
         # Check if this rank should be killed
