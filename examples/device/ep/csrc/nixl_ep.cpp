@@ -353,6 +353,8 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
         if (remote_mds.has_value())
             new_ranks_mds.push_back((*remote_mds)[i]);
 
+        CUDA_CHECK(cudaMemset(mask_buffer_ptr + remote_rank, 0, sizeof(int)));
+
         if (enable_shrink) {
             _nixl_ep_barrier_buffer_clear(remote_rank);
         }
