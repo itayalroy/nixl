@@ -368,6 +368,17 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 
 void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
     EP_HOST_ASSERT(!remote_ranks_list.empty());
+    // print remote_ranks_list and remote_ranks
+    printf("remote_ranks_list: ");
+    for (int rank : remote_ranks_list) {
+        printf("%d ", rank);
+    }
+    printf("\n");
+    printf("remote_ranks: ");
+    for (int rank : remote_ranks) {
+        printf("%d ", rank);
+    }
+    printf("\n");
     EP_HOST_ASSERT(remote_ranks_list.size() <= remote_ranks.size());
 
     CUDA_CHECK(cudaDeviceSynchronize());
