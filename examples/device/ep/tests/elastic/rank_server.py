@@ -13,146 +13,289 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+Rank management using torch.distributed.TCPStore.
+
+Provides distributed rank assignment with:
+- Local rank assignment per hostname
+- Global rank assignment with recycling of released ranks
+- User context passing from released ranks to new owners
+
+The TCPStore is created externally (via store_group module) and passed
+to RankClient, allowing the same store to be shared with nixl_ep for
+metadata exchange.
+"""
+
+import json
 import os
-import socket
 import time
-from collections import defaultdict
-from socketserver import StreamRequestHandler, ThreadingTCPServer
-from threading import Lock
+from typing import Optional, Tuple, Union
 
-import torch
+import torch.distributed as dist
 
+from store_group import create_master_store, create_client_store
 
-# --- Request handler ---
-class RankServerHandler(StreamRequestHandler):
-    _counts: defaultdict[str, list[int]] = defaultdict(
-        list
-    )  # List of used local ranks per host
-    _global: int = 0
-    _lock: Lock = Lock()
-    _rank_to_host: dict[int, tuple[str, int]] = (
-        {}
-    )  # Maps global rank to (host, local_rank)
-    _user_context: dict[str, str | None] = {}
-    _all_global_ranks: set[int] = set()
-    _removed_global_ranks: set[int] = set()
-
-    def handle(self):
-        with self._lock:
-            line = self.rfile.readline().strip().decode()
-
-            if line.startswith("RELEASE_RANK"):
-                # Handle rank release - remove from used ranks list
-                if len(self._all_global_ranks) > 0:
-                    # Find the highest assigned rank and release it
-                    rank_to_release = int(line.split()[1])
-                    self._all_global_ranks.remove(rank_to_release)
-                    self._removed_global_ranks.add(rank_to_release)
-                    self._user_context[str(rank_to_release)] = line.split()[2]
-
-                    if rank_to_release in self._rank_to_host:
-                        host, local_rank = self._rank_to_host[rank_to_release]
-                        # Remove this local rank from the used list
-                        if local_rank in self._counts[host]:
-                            self._counts[host].remove(local_rank)
-                        # Remove the mapping
-                        del self._rank_to_host[rank_to_release]
-                    self.wfile.write("OK\n".encode())
-                else:
-                    self.wfile.write("ERROR: No ranks to release\n".encode())
-            else:
-                # Handle rank assignment - find lowest unused local rank
-                host = line
-                # Find the lowest unused local rank for this host
-                used_ranks = set(self._counts[host])
-                local = 0
-                while local in used_ranks:
-                    local += 1
-
-                # Add this local rank to the used list
-                self._counts[host].append(local)
-                if len(self._removed_global_ranks) == 0:
-                    global_rank = len(self._all_global_ranks)
-                else:
-                    global_rank = min(self._removed_global_ranks)
-                    self._removed_global_ranks.remove(global_rank)
-
-                self._all_global_ranks.add(global_rank)
-                # Record which host and local rank this global rank maps to
-                self._rank_to_host[global_rank] = (host, local)
-                if str(global_rank) not in self._user_context:
-                    self._user_context[str(global_rank)] = None
-                (
-                    self.wfile.write(
-                        f"{local} {global_rank} {self._user_context[str(global_rank)]}\n".encode()
-                    )
-                    if self._user_context[str(global_rank)] is not None
-                    else self.wfile.write(f"{local} {global_rank}\n".encode())
-                )
+# Key schema constants
+_KEY_NEXT_GLOBAL_RANK = "rank_server/next_global_rank"
+_KEY_RELEASED_RANKS = "rank_server/released_ranks"
+_KEY_LOCK = "rank_server/lock"
 
 
-# --- TCPServer subclass to reuse port immediately ---
-class ReusableTCPServer(ThreadingTCPServer):
-    allow_reuse_address = True
+def _host_local_ranks_key(hostname: str) -> str:
+    return f"rank_server/host/{hostname}/local_ranks"
 
 
-# --- Lazy-start server ---
+def _rank_context_key(global_rank: int) -> str:
+    return f"rank_server/rank/{global_rank}/context"
+
+
+def _rank_hostname_key(global_rank: int) -> str:
+    return f"rank_server/rank/{global_rank}/hostname"
+
+
+def _rank_local_key(global_rank: int) -> str:
+    return f"rank_server/rank/{global_rank}/local_rank"
+
+
+def init_rank_server_keys(store: dist.TCPStore) -> None:
+    """
+    Initialize the rank server metadata keys in the store.
+
+    This should be called once by the master process after creating
+    the store but before any RankClient operations.
+
+    Args:
+        store: The TCPStore to initialize
+    """
+    store.set(_KEY_NEXT_GLOBAL_RANK, "0")
+    store.set(_KEY_RELEASED_RANKS, "[]")
+    store.set(_KEY_LOCK, "0")  # 0 = unlocked, 1 = locked
+
+
+# --- Server API (for backwards compatibility) ---
+
+
 def start_server(port: int = 9999) -> None:
+    """
+    Start a rank server (TCPStore master) and block forever.
+
+    This is the backwards-compatible API that starts the server process.
+    For more control, use store_group.create_master_store() directly.
+
+    Args:
+        port: Port for the TCPStore server
+    """
     try:
-        server = ReusableTCPServer(("0.0.0.0", port), RankServerHandler)
-        server.serve_forever()
+        store = create_master_store(port=port, timeout_sec=365 * 24 * 3600)
+        init_rank_server_keys(store)
+        # Block forever to keep the server alive
+        while True:
+            time.sleep(1)
     except OSError:
-        pass  # another process already started the server
-
-
-def start_server_process(port: int = 9999):
-    server_process = torch.multiprocessing.Process(
-        target=start_server, args=(port,), daemon=False
-    )
-    server_process.start()
-    time.sleep(1)
-    return server_process
+        # Port already in use - another server is running
+        pass
 
 
 # --- Client API ---
+
+
 class RankClient:
+    """
+    Client for distributed rank management using TCPStore.
 
-    def __init__(self, server: str = "127.0.0.1", port: int = 9999):
-        self.self_global_rank = None
-        self.server = server
-        self.port = port
+    Provides methods to acquire and release distributed ranks with
+    optional user context passing between rank owners.
+    """
 
-    def get_rank(self):
+    def __init__(
+        self,
+        store_or_server: Union[dist.TCPStore, str] = "127.0.0.1",
+        port: int = 9999,
+    ):
+        """
+        Initialize the rank client.
+
+        Args:
+            store_or_server: Either a TCPStore instance (created via store_group)
+                           or a server address string (for backwards compatibility)
+            port: Port for the TCPStore (only used if store_or_server is a string)
+        """
+        self.self_global_rank: Optional[int] = None
+        self._hostname = os.uname().nodename
+
+        if isinstance(store_or_server, dist.TCPStore):
+            self._store = store_or_server
+        else:
+            # Backwards compatibility: create client store from address
+            self._store = create_client_store(
+                master_addr=store_or_server, port=port, timeout_sec=300.0
+            )
+
+    @property
+    def store(self) -> dist.TCPStore:
+        """Get the underlying TCPStore (for passing to nixl_ep)."""
+        return self._store
+
+    def _acquire_lock(self) -> None:
+        """Acquire distributed lock using compare_set."""
+        # Use a unique identifier for this client
+        my_id = f"{self._hostname}_{os.getpid()}"
+        while True:
+            # Try to set lock from "0" (unlocked) to our ID
+            result = self._store.compare_set(_KEY_LOCK, "0", my_id)
+            if result.decode() == my_id:
+                # We got the lock (value is now our ID)
+                return
+            if result == b"0":
+                # Race condition: value was 0 but someone else got it first
+                # Try again immediately
+                continue
+            # Lock is held by someone else, wait
+            time.sleep(0.001)
+
+    def _release_lock(self) -> None:
+        """Release distributed lock."""
+        self._store.set(_KEY_LOCK, "0")
+
+    def _get_json_list(self, key: str) -> list:
+        """Get a JSON list from store."""
+        try:
+            # Try to set empty list first - compare_set with empty expected means 
+            # "set if doesn't exist"
+            self._store.compare_set(key, "", "[]")
+            data = self._store.get(key).decode()
+            return json.loads(data) if data else []
+        except Exception:
+            # Key doesn't exist or other error
+            return []
+
+    def _set_json_list(self, key: str, value: list):
+        """Set a JSON list in store."""
+        self._store.set(key, json.dumps(value))
+
+    def get_rank(self) -> Tuple[int, int, Optional[int]]:
+        """
+        Get a rank assignment.
+
+        Returns:
+            Tuple of (local_rank, global_rank, user_context)
+            - local_rank: The local rank on this host (0, 1, 2, ...)
+            - global_rank: The global rank across all hosts
+            - user_context: Context from previous owner if this is a recycled rank,
+                          None otherwise. Returned as int if parseable, else None.
+
+        Raises:
+            RuntimeError: If a rank is already assigned to this client
+        """
         if self.self_global_rank is not None:
             print(
                 f"WARNING: rank already assigned - returning existing rank {self.self_global_rank}",
                 flush=True,
             )
-            return self.self_global_rank
-        s = socket.create_connection((self.server, self.port))
-        s.sendall(f"{os.uname().nodename}\n".encode())
-        server_response = s.recv(1024).decode().split()
-        if len(server_response) == 2:
-            local_rank, global_rank = tuple(map(int, server_response))
-            user_context = None
-        else:
-            local_rank, global_rank, user_context = tuple(map(int, server_response))
-        s.close()
+            return self.self_global_rank, self.self_global_rank, None
+
+        self._acquire_lock()
+
+        try:
+            user_context: Optional[int] = None
+
+            # Check for released ranks to recycle
+            released = self._get_json_list(_KEY_RELEASED_RANKS)
+
+            if released:
+                # Take the lowest released rank
+                global_rank = min(released)
+                released.remove(global_rank)
+                self._set_json_list(_KEY_RELEASED_RANKS, released)
+
+                # Get user context if any
+                try:
+                    ctx_data = self._store.get(_rank_context_key(global_rank)).decode()
+                    if ctx_data and ctx_data != "None":
+                        try:
+                            user_context = int(ctx_data)
+                        except ValueError:
+                            user_context = None
+                    self._store.delete_key(_rank_context_key(global_rank))
+                except RuntimeError:
+                    pass
+            else:
+                # Allocate new global rank
+                next_rank = int(self._store.get(_KEY_NEXT_GLOBAL_RANK).decode())
+                global_rank = next_rank
+                self._store.set(_KEY_NEXT_GLOBAL_RANK, str(next_rank + 1))
+
+            # Find lowest unused local rank for this hostname
+            local_ranks_key = _host_local_ranks_key(self._hostname)
+            used_local_ranks = set(self._get_json_list(local_ranks_key))
+            local_rank = 0
+            while local_rank in used_local_ranks:
+                local_rank += 1
+
+            # Allocate local rank
+            used_local_ranks.add(local_rank)
+            self._set_json_list(local_ranks_key, list(used_local_ranks))
+
+            # Store rank metadata
+            self._store.set(_rank_hostname_key(global_rank), self._hostname)
+            self._store.set(_rank_local_key(global_rank), str(local_rank))
+
+        finally:
+            self._release_lock()
+
         self.self_global_rank = global_rank
         return local_rank, global_rank, user_context
 
     def release_rank(self, user_context: str | None = None) -> bool:
-        """Release a rank (decrement the global counter by 1)"""
-        s = socket.create_connection((self.server, self.port))
-        s.sendall(
-            f"RELEASE_RANK {self.self_global_rank if self.self_global_rank is not None else -1} {user_context}\n".encode()
-        )
-        response = s.recv(1024).decode().strip()
-        s.close()
+        """
+        Release the currently held rank.
+
+        Args:
+            user_context: Optional context to pass to the next process
+                         that acquires this rank.
+
+        Returns:
+            True if successful, False otherwise.
+        """
+        if self.self_global_rank is None:
+            return False
+
+        global_rank = self.self_global_rank
+        self._acquire_lock()
+
+        try:
+            # Get rank info
+            try:
+                hostname = self._store.get(_rank_hostname_key(global_rank)).decode()
+                local_rank = int(self._store.get(_rank_local_key(global_rank)).decode())
+            except RuntimeError:
+                return False
+
+            # Release local rank from host
+            local_ranks_key = _host_local_ranks_key(hostname)
+            used_local_ranks = self._get_json_list(local_ranks_key)
+            if local_rank in used_local_ranks:
+                used_local_ranks.remove(local_rank)
+            self._set_json_list(local_ranks_key, used_local_ranks)
+
+            # Store user context for next owner
+            if user_context is not None:
+                self._store.set(_rank_context_key(global_rank), str(user_context))
+
+            # Clean up rank metadata
+            try:
+                self._store.delete_key(_rank_hostname_key(global_rank))
+                self._store.delete_key(_rank_local_key(global_rank))
+            except RuntimeError:
+                pass
+
+            # Add to released ranks pool
+            released = self._get_json_list(_KEY_RELEASED_RANKS)
+            released.append(global_rank)
+            self._set_json_list(_KEY_RELEASED_RANKS, released)
+
+        finally:
+            self._release_lock()
+
         self.self_global_rank = None
-        return response == "OK"
-
-
-# --- Example usage ---
-if __name__ == "__main__":
-    start_server()
+        return True

@@ -30,6 +30,7 @@ from typing import cast
 
 import nixl_ep
 import rank_server
+import store_group
 import torch
 from plan import Plan
 
@@ -438,10 +439,19 @@ def test_main(
 
 
 def worker(torch_rank: int, args: argparse.Namespace):
-    rank_client = rank_server.RankClient(
-        args.rank_server if args.rank_server else "127.0.0.1"
+    # Create TCPStore client for both rank management and NIXL metadata exchange
+    tcp_store = store_group.create_client_store(
+        master_addr=args.rank_server if args.rank_server else "127.0.0.1",
+        port=args.rank_server_port,
     )
+    rank_client = rank_server.RankClient(tcp_store)
     local_rank, global_rank, last_active_phase = rank_client.get_rank()
+
+    print(
+        f"Process {torch_rank} -> global_rank={global_rank}, local_rank={local_rank}",
+        flush=True,
+    )
+
     plan = Plan(
         args.plan,
         global_rank,
@@ -455,10 +465,6 @@ def worker(torch_rank: int, args: argparse.Namespace):
         return
 
     max_num_ranks = plan.get_max_rank() + 1
-    print(
-        f"Process {torch_rank} -> global_rank={global_rank}, local_rank={local_rank}",
-        flush=True,
-    )
 
     # Initialize torch
     os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank % 8)
@@ -480,9 +486,6 @@ def worker(torch_rank: int, args: argparse.Namespace):
     tcp_nics = ",ibp154s0,ibp192s0,ibp206s0,ibp220s0,ibp94s0"
     os.environ["UCX_NET_DEVICES"] = f"cuda0-{pxb_nics[local_rank]}:1" + tcp_nics
 
-    # Initialize NIXL
-    os.environ["NIXL_ETCD_ENDPOINTS"] = args.etcd_server
-
     # Initialize nixl_ep buffer
     num_rdma_bytes = nixl_ep.Buffer.get_rdma_size_hint(
         args.num_tokens,
@@ -498,6 +501,7 @@ def worker(torch_rank: int, args: argparse.Namespace):
         nvlink_backend=args.nvlink_backend,
         explicitly_destroy=True,
         enable_shrink=True,
+        tcp_store_group=tcp_store,
     )
     buffer.update_memory_buffers(
         num_ranks=max_num_ranks,
@@ -616,15 +620,15 @@ def main():
     parser.add_argument("--hidden-dim", type=int, default=7168, help="Hidden dimension")
     parser.add_argument("--num-topk", type=int, default=8, help="Number of topk")
     parser.add_argument(
-        "--etcd-server",
-        type=str,
-        default="http://127.0.0.1:2379",
-        help="ETCD server address for NIXL (default: http://127.0.0.1:2379)",
-    )
-    parser.add_argument(
         "--rank-server",
         type=str,
         help="Rank server address. If not set, a rank server will be started locally and will be killed after all the workers launched in this run are finished.",
+    )
+    parser.add_argument(
+        "--rank-server-port",
+        type=int,
+        default=9999,
+        help="Rank server port (default: 9999)",
     )
     parser.add_argument("--kineto", action="store_true", help="Enable kineto profiling")
     parser.add_argument(
@@ -640,14 +644,16 @@ def main():
     assert (
         args.nvlink_backend != "nixl"
     ), "NIXL does not support NVLink on multiple workers yet"
-    rank_server_process = None
+
+    # Create TCPStore master if no external rank server is specified
+    master_store = None
     if not args.rank_server:
-        print("Starting rank server locally", flush=True)
-        rank_server_process = torch.multiprocessing.Process(
-            target=rank_server.start_server, daemon=True
+        master_store = store_group.create_master_store(
+            port=args.rank_server_port,
+            timeout_sec=365 * 24 * 3600,  # 1 year timeout
         )
-        rank_server_process.start()
-        time.sleep(0.5)
+        rank_server.init_rank_server_keys(master_store)
+
     if args.num_processes == 1:
         worker(0, args)
         return
