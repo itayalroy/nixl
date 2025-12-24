@@ -82,6 +82,7 @@ class RankManager(RankManagerBase):
             )
             return 0, self._global_rank, None
 
+        start = time.perf_counter()
         with self._lock():
             user_context: Optional[str] = None
             released = self._get_json_list(_KEY_RELEASED_RANKS)
@@ -113,6 +114,8 @@ class RankManager(RankManagerBase):
             self._store.set(_rank_local_key(global_rank), str(local_rank))
 
         self._global_rank = global_rank
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        print(f"[tcp_store] get_rank took {elapsed_ms:.2f} ms", flush=True)
         return local_rank, global_rank, user_context
 
     def release_rank(self, user_context: Optional[str] = None) -> bool:

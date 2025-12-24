@@ -128,6 +128,7 @@ class RankManager(RankManagerBase):
                 flush=True,
             )
             return 0, self._global_rank, None
+        start = time.perf_counter()
         s = socket.create_connection((self._server, self._port))
         s.sendall(f"{os.uname().nodename}\n".encode())
         server_response = s.recv(1024).decode().split()
@@ -136,6 +137,8 @@ class RankManager(RankManagerBase):
         user_context = server_response[2] if len(server_response) > 2 else None
         s.close()
         self._global_rank = global_rank
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        print(f"[tcp] get_rank took {elapsed_ms:.2f} ms", flush=True)
         return local_rank, global_rank, user_context
 
     def release_rank(self, user_context: Optional[str] = None) -> bool:

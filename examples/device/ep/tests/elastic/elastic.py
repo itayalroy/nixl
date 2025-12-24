@@ -451,7 +451,7 @@ def worker(torch_rank: int, args: argparse.Namespace):
     else:
         rank_client = tcp_rank_manager.RankManager(
             server=args.tcp_server if args.tcp_server else "127.0.0.1",
-            port=args.tcp_server_port,
+            port=args.tcp_server_port + 1,
         )
 
     local_rank, global_rank, last_active_phase = rank_client.get_rank()
@@ -657,7 +657,7 @@ def main():
     if not args.tcp_server:
         store_group.start_master_store_process(port=args.tcp_server_port)
         if args.rank_manager == "tcp":
-            tcp_rank_manager.start_server_process(args.tcp_server_port)
+            tcp_rank_manager.start_server_process(args.tcp_server_port + 1)
 
     if args.num_processes == 1:
         worker(0, args)
