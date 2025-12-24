@@ -13,32 +13,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from datetime import timedelta
+from multiprocessing import Process
 
 import torch.distributed as dist
 
+_KEY_NEXT_GLOBAL_RANK = "rank_manager/next_global_rank"
+_KEY_RELEASED_RANKS = "rank_manager/released_ranks"
+_KEY_LOCK = "rank_manager/lock"
 
-def create_master_store(
-    port: int = 9999,
-    timeout_sec: float = 300.0,
-) -> dist.TCPStore:
-    """
-    Create a TCPStore master (server).
 
-    Args:
-        port: Port for the TCPStore server
-        timeout_sec: Timeout for store operations
-
-    Returns:
-        A TCPStore instance acting as the master
-    """
-    return dist.TCPStore(
+def _run_master_store(port: int, timeout_sec: float) -> None:
+    store = dist.TCPStore(
         host_name="0.0.0.0",
         port=port,
         is_master=True,
         wait_for_workers=False,
         timeout=timedelta(seconds=timeout_sec),
     )
+    store.set(_KEY_NEXT_GLOBAL_RANK, "0")
+    store.set(_KEY_RELEASED_RANKS, "[]")
+    store.set(_KEY_LOCK, "0")
+    while True:
+        time.sleep(3600)
+
+
+def start_master_store_process(
+    port: int = 9999,
+    timeout_sec: float = 365 * 24 * 3600,
+) -> Process:
+    process = Process(target=_run_master_store, args=(port, timeout_sec), daemon=True)
+    process.start()
+    time.sleep(1)
+    return process
 
 
 def create_client_store(
@@ -46,17 +54,6 @@ def create_client_store(
     port: int = 9999,
     timeout_sec: float = 300.0,
 ) -> dist.TCPStore:
-    """
-    Create a TCPStore client.
-
-    Args:
-        master_addr: Address of the master node
-        port: Port of the TCPStore server
-        timeout_sec: Timeout for store operations
-
-    Returns:
-        A TCPStore instance connected to the master
-    """
     return dist.TCPStore(
         host_name=master_addr,
         port=port,

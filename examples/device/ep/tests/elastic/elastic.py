@@ -29,10 +29,11 @@ from functools import partial
 from typing import cast
 
 import nixl_ep
-import rank_server
 import store_group
 import torch
 from plan import Plan
+from rank_manager import tcp_rank_manager, tcp_store_rank_manager
+from rank_manager.rank_manager import RankManagerBase
 
 # Add tests directory to path to import test utils
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -51,7 +52,7 @@ def handle_sigterm(
     frame,
     buffer: nixl_ep.Buffer,
     plan: Plan,
-    rank_client: rank_server.RankClient,
+    rank_client: RankManagerBase,
 ):
     print(
         f"SIGTERM ({signum}) received for process {os.getpid()}! releasing rank and exiting...",
@@ -444,7 +445,15 @@ def worker(torch_rank: int, args: argparse.Namespace):
         port=args.tcp_server_port,
     )
 
-    rank_client = rank_server.RankClient(tcp_store)
+    rank_client: RankManagerBase
+    if args.rank_manager == "tcp_store":
+        rank_client = tcp_store_rank_manager.RankManager(tcp_store)
+    else:
+        rank_client = tcp_rank_manager.RankManager(
+            server=args.tcp_server if args.tcp_server else "127.0.0.1",
+            port=args.tcp_server_port,
+        )
+
     local_rank, global_rank, last_active_phase = rank_client.get_rank()
     print(
         f"Process {torch_rank} -> global_rank={global_rank}, local_rank={local_rank}",
@@ -636,17 +645,19 @@ def main():
         default="ipc",
         help="NVLink backend to use",
     )
+    parser.add_argument(
+        "--rank-manager",
+        choices=["tcp_store", "tcp"],
+        default="tcp_store",
+        help="Rank server implementation (default: tcp_store)",
+    )
 
     args = parser.parse_args()
 
-    # Create TCPStore master if no external rank server is specified
-    master_store = None
     if not args.tcp_server:
-        master_store = store_group.create_master_store(
-            port=args.tcp_server_port,
-            timeout_sec=365 * 24 * 3600,  # 1 year timeout
-        )
-        rank_server.init_rank_server_keys(master_store)
+        store_group.start_master_store_process(port=args.tcp_server_port)
+        if args.rank_manager == "tcp":
+            tcp_rank_manager.start_server_process(args.tcp_server_port)
 
     if args.num_processes == 1:
         worker(0, args)
