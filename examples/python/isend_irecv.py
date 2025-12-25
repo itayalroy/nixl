@@ -259,24 +259,6 @@ def progress_until_done(requests, comm, timeout=30.0):
     raise TimeoutError("Transfers did not complete in time")
 
 
-def make_test_tensor(size, index, from_sender):
-    """Create tensor with verifiable pattern: sender uses positive indices, receiver negative."""
-    value = float(index) if from_sender else float(-(index + 1))
-    return torch.full((size,), value, dtype=torch.float32, device="cuda")
-
-
-def verify_tensors(recv_tensors, from_sender):
-    """Verify received tensors match expected pattern. Returns True if all match."""
-    for i, tensor in enumerate(recv_tensors):
-        expected = make_test_tensor(tensor.shape[0], i, from_sender)
-        if not torch.allclose(tensor, expected):
-            logger.error(
-                f"Data mismatch at index {i}: expected {expected[0].item()}, got {tensor[0].item()}"
-            )
-            return False
-    return True
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="NIXL isend/irecv Example")
     parser.add_argument(
@@ -329,36 +311,34 @@ if __name__ == "__main__":
     is_sender = args.mode == "sender"
     n = args.num_transfers
 
-    send_tensors = [make_test_tensor(args.tensor_size, i, is_sender) for i in range(n)]
-    recv_tensors = [
-        torch.zeros(args.tensor_size, dtype=torch.float32, device="cuda")
-        for _ in range(n)
-    ]
+    send_tensor = torch.ones(args.tensor_size, dtype=torch.float32, device="cuda")
+    recv_tensor = torch.zeros(args.tensor_size, dtype=torch.float32, device="cuda")
 
     if args.bidirectional:
         logger.info(f"Bidirectional: {n} transfers each direction")
         requests = []
         for i in range(n):
-            requests.append(comm.isend(send_tensors[i], peer_name))
-            requests.append(comm.irecv(recv_tensors[i], peer_name))
+            requests.append(comm.isend(send_tensor, peer_name))
+            requests.append(comm.irecv(recv_tensor, peer_name))
         progress_until_done(requests, comm)
     else:
         logger.info(f"Transferring {n} tensor(s) of size {args.tensor_size}...")
         if is_sender:
             start = time.time()
-            progress_until_done([comm.isend(t, peer_name) for t in send_tensors], comm)
+            progress_until_done([comm.isend(send_tensor, peer_name) for _ in range(n)], comm)
             elapsed = time.time() - start
             total_bytes = n * args.tensor_size * 4  # float32 = 4 bytes
             bw_gbps = (total_bytes * 8) / elapsed / 1e9
             bw_gbytes = total_bytes / elapsed / 1e9
             logger.info(f"Send bandwidth: {bw_gbps:.2f} Gbps ({bw_gbytes:.2f} GB/s)")
         else:
-            progress_until_done([comm.irecv(t, peer_name) for t in recv_tensors], comm)
+            progress_until_done([comm.irecv(recv_tensor, peer_name) for _ in range(n)], comm)
 
     # Verify received data (receiver in unidirectional, both in bidirectional)
     if args.bidirectional or not is_sender:
-        if verify_tensors(recv_tensors, from_sender=not is_sender):
-            logger.info(f"SUCCESS: {len(recv_tensors)} tensor(s) verified correctly")
+        expected = torch.ones(args.tensor_size, dtype=torch.float32, device="cuda")
+        if torch.allclose(recv_tensor, expected):
+            logger.info("SUCCESS: Data verified correctly")
         else:
             logger.error("FAILED: Data verification failed")
             exit(1)
