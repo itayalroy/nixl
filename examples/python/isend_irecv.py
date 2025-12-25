@@ -345,7 +345,13 @@ if __name__ == "__main__":
     else:
         logger.info(f"Transferring {n} tensor(s) of size {args.tensor_size}...")
         if is_sender:
+            start = time.time()
             progress_until_done([comm.isend(t, peer_name) for t in send_tensors], comm)
+            elapsed = time.time() - start
+            total_bytes = n * args.tensor_size * 4  # float32 = 4 bytes
+            bw_gbps = (total_bytes * 8) / elapsed / 1e9
+            bw_gbytes = total_bytes / elapsed / 1e9
+            logger.info(f"Send bandwidth: {bw_gbps:.2f} Gbps ({bw_gbytes:.2f} GB/s)")
         else:
             progress_until_done([comm.irecv(t, peer_name) for t in recv_tensors], comm)
 
