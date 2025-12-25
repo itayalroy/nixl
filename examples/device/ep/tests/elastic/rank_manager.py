@@ -15,6 +15,7 @@
 
 import json
 import os
+import threading
 import time
 from contextlib import contextmanager
 from typing import Iterator, Optional, Tuple
@@ -57,7 +58,7 @@ class RankManager:
 
     @contextmanager
     def _lock(self) -> Iterator[None]:
-        my_id = f"{self._hostname}_{os.getpid()}"
+        my_id = f"{self._hostname}_{os.getpid()}_{threading.get_ident()}"
         while True:
             result = self._store.compare_set(_KEY_LOCK, "0", my_id)
             if result.decode() == my_id:
