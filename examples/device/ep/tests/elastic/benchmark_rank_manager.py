@@ -25,8 +25,8 @@ Usage:
 """
 
 import argparse
+import multiprocessing as mp
 import statistics
-import threading
 import time
 
 import rank_manager
@@ -49,64 +49,72 @@ def worker(
     rank_id: int,
     host: str,
     port: int,
-    results: list,
-    barrier: threading.Barrier,
+    result_queue: mp.Queue,
+    barrier: mp.Barrier,
 ):
     store = store_group.create_client_store(master_addr=host, port=port)
     mgr = rank_manager.RankManager(store)
 
-    # Wait for all threads to be ready
+    # Wait for all processes to be ready
     barrier.wait()
 
     start = time.perf_counter()
     local_rank, global_rank, _ = mgr.get_rank()
     elapsed_ms = (time.perf_counter() - start) * 1000
 
-    results[rank_id] = {
+    result_queue.put({
+        "rank_id": rank_id,
         "local_rank": local_rank,
         "global_rank": global_rank,
         "elapsed_ms": elapsed_ms,
-    }
+    })
 
 
 def run_benchmark(host: str, port: int, num_ranks: int):
     print(f"Connecting to TCPStore at {host}:{port}")
-    print(f"Spawning {num_ranks} threads...")
+    print(f"Spawning {num_ranks} processes...")
 
-    results = [None] * num_ranks
-    barrier = threading.Barrier(num_ranks)
-    threads = []
+    result_queue = mp.Queue()
+    barrier = mp.Barrier(num_ranks)
+    processes = []
 
     for i in range(num_ranks):
-        t = threading.Thread(target=worker, args=(i, host, port, results, barrier))
-        threads.append(t)
+        p = mp.Process(target=worker, args=(i, host, port, result_queue, barrier))
+        processes.append(p)
 
-    # Start all threads
+    # Start all processes
     start_all = time.perf_counter()
-    for t in threads:
-        t.start()
+    for p in processes:
+        p.start()
 
-    # Wait for all threads to complete
-    for t in threads:
-        t.join()
+    # Wait for all processes to complete
+    for p in processes:
+        p.join()
     total_time_ms = (time.perf_counter() - start_all) * 1000
+
+    # Collect results
+    results = {}
+    while not result_queue.empty():
+        r = result_queue.get()
+        results[r["rank_id"]] = r
 
     # Print results
     print("\n" + "=" * 60)
     print("Results:")
     print("=" * 60)
 
-    times = [r["elapsed_ms"] for r in results]
-    for i, r in enumerate(results):
+    times = [results[i]["elapsed_ms"] for i in range(num_ranks)]
+    for i in range(num_ranks):
+        r = results[i]
         print(
-            f"  Thread {i:2d}: global_rank={r['global_rank']:2d}, "
+            f"  Process {i:2d}: global_rank={r['global_rank']:2d}, "
             f"local_rank={r['local_rank']:2d}, time={r['elapsed_ms']:.2f} ms"
         )
 
     print("\n" + "-" * 60)
     print("Summary:")
     print("-" * 60)
-    print(f"  Total threads:    {num_ranks}")
+    print(f"  Total processes:  {num_ranks}")
     print(f"  Total time:       {total_time_ms:.2f} ms")
     print(f"  Min latency:      {min(times):.2f} ms")
     print(f"  Max latency:      {max(times):.2f} ms")
