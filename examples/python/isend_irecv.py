@@ -101,10 +101,31 @@ class CommunicationManager:
                 return msg
         return None
 
+    def register_buffer(self, tensor: torch.Tensor):
+        """Pre-register a buffer for use with isend/irecv. Returns (reg_descs, local_descs)."""
+        reg_descs = self.agent.register_memory([tensor])
+        if not reg_descs:
+            raise RuntimeError(f"register_buffer: failed to register memory for {tensor.shape}")
+        local_descs = reg_descs.trim()
+        return reg_descs, local_descs
+
+    def deregister_buffer(self, reg_descs):
+        """Deregister a previously registered buffer."""
+        self.agent.deregister_memory(reg_descs)
+
     def isend(
-        self, tensor: torch.Tensor, dst_agent: str, tag: Optional[str] = None
+        self,
+        tensor: torch.Tensor,
+        dst_agent: str,
+        tag: Optional[str] = None,
+        preregistered: Optional[tuple] = None,
     ) -> Request:
-        """Non-blocking send. Returns Request to track via progress()."""
+        """Non-blocking send. Returns Request to track via progress().
+        
+        Args:
+            preregistered: Optional (reg_descs, local_descs) from register_buffer().
+                          If provided, skips registration and deregistration is caller's responsibility.
+        """
         if tag is None:
             tag = "default"
 
@@ -112,25 +133,39 @@ class CommunicationManager:
         seq = self._send_seq_counters.get(key, 0)
         self._send_seq_counters[key] = seq + 1
 
-        reg_descs = self.agent.register_memory([tensor])
-        if not reg_descs:
-            raise RuntimeError(f"isend: failed to register memory for {tensor.shape}")
+        if preregistered is not None:
+            reg_descs, local_descs = preregistered
+            owns_registration = False
+        else:
+            reg_descs = self.agent.register_memory([tensor])
+            if not reg_descs:
+                raise RuntimeError(f"isend: failed to register memory for {tensor.shape}")
+            local_descs = reg_descs.trim()
+            owns_registration = True
 
-        local_descs = reg_descs.trim()
-
-        return Request(
+        req = Request(
             RequestType.SEND,
             dst_agent,
             tag,
             seq,
-            reg_descs=reg_descs,
+            reg_descs=reg_descs if owns_registration else None,
             local_descs=local_descs,
         )
+        return req
 
     def irecv(
-        self, tensor: torch.Tensor, src_agent: str, tag: Optional[str] = None
+        self,
+        tensor: torch.Tensor,
+        src_agent: str,
+        tag: Optional[str] = None,
+        preregistered: Optional[tuple] = None,
     ) -> Request:
-        """Non-blocking receive into pre-allocated tensor. Returns Request to track via progress()."""
+        """Non-blocking receive into pre-allocated tensor. Returns Request to track via progress().
+        
+        Args:
+            preregistered: Optional (reg_descs, local_descs) from register_buffer().
+                          If provided, skips registration and deregistration is caller's responsibility.
+        """
         if tag is None:
             tag = "default"
 
@@ -138,11 +173,16 @@ class CommunicationManager:
         seq = self._recv_seq_counters.get(key, 0)
         self._recv_seq_counters[key] = seq + 1
 
-        reg_descs = self.agent.register_memory([tensor])
-        if not reg_descs:
-            raise RuntimeError(f"irecv: failed to register memory for {tensor.shape}")
+        if preregistered is not None:
+            reg_descs, local_descs = preregistered
+            owns_registration = False
+        else:
+            reg_descs = self.agent.register_memory([tensor])
+            if not reg_descs:
+                raise RuntimeError(f"irecv: failed to register memory for {tensor.shape}")
+            local_descs = reg_descs.trim()
+            owns_registration = True
 
-        local_descs = reg_descs.trim()
         partial_md = self.agent.get_partial_agent_metadata(
             reg_descs, inc_conn_info=False, backends=[]
         )
@@ -156,7 +196,7 @@ class CommunicationManager:
             src_agent,
             tag,
             seq,
-            reg_descs=reg_descs,
+            reg_descs=reg_descs if owns_registration else None,
             local_descs=local_descs,
         )
 
@@ -331,6 +371,10 @@ if __name__ == "__main__":
     send_tensor = torch.ones(args.tensor_size, dtype=torch.float32, device="cuda")
     recv_tensor = torch.zeros(args.tensor_size, dtype=torch.float32, device="cuda")
 
+    # Pre-register buffers before timing
+    send_reg = comm.register_buffer(send_tensor)
+    recv_reg = comm.register_buffer(recv_tensor)
+
     # Synchronize before transfers
     comm.barrier(peer_name)
 
@@ -338,21 +382,31 @@ if __name__ == "__main__":
         logger.info(f"Bidirectional: {n} transfers each direction")
         requests = []
         for i in range(n):
-            requests.append(comm.isend(send_tensor, peer_name))
-            requests.append(comm.irecv(recv_tensor, peer_name))
+            requests.append(comm.isend(send_tensor, peer_name, preregistered=send_reg))
+            requests.append(comm.irecv(recv_tensor, peer_name, preregistered=recv_reg))
         progress_until_done(requests, comm)
     else:
         logger.info(f"Transferring {n} tensor(s) of size {args.tensor_size}...")
         if is_sender:
             start = time.time()
-            progress_until_done([comm.isend(send_tensor, peer_name) for _ in range(n)], comm)
+            progress_until_done(
+                [comm.isend(send_tensor, peer_name, preregistered=send_reg) for _ in range(n)],
+                comm,
+            )
             elapsed = time.time() - start
             total_bytes = n * args.tensor_size * 4  # float32 = 4 bytes
             bw_gbps = (total_bytes * 8) / elapsed / 1e9
             bw_gbytes = total_bytes / elapsed / 1e9
             logger.info(f"Send bandwidth: {bw_gbps:.2f} Gbps ({bw_gbytes:.2f} GB/s)")
         else:
-            progress_until_done([comm.irecv(recv_tensor, peer_name) for _ in range(n)], comm)
+            progress_until_done(
+                [comm.irecv(recv_tensor, peer_name, preregistered=recv_reg) for _ in range(n)],
+                comm,
+            )
+
+    # Deregister buffers after transfers
+    comm.deregister_buffer(send_reg[0])
+    comm.deregister_buffer(recv_reg[0])
 
     # Verify received data (receiver in unidirectional, both in bidirectional)
     if args.bidirectional or not is_sender:
