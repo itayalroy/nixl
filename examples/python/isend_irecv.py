@@ -246,6 +246,23 @@ class CommunicationManager:
     def batch_progress(self, requests: list[Request]) -> Dict[Request, RequestStatus]:
         return {req: self.progress(req) for req in requests}
 
+    def barrier(self, peer_agent: str, timeout: float = 30.0) -> None:
+        """Synchronize with peer agent using notifications."""
+        msg = pickle.dumps(("BARRIER", time.time()))
+        self.agent.send_notif(peer_agent, msg)
+
+        start = time.time()
+        while time.time() - start < timeout:
+            self._poll_notifications()
+            if peer_agent in self._notif_buffer:
+                for i, raw in enumerate(self._notif_buffer[peer_agent]):
+                    parsed = pickle.loads(raw)
+                    if parsed[0] == "BARRIER":
+                        self._notif_buffer[peer_agent].pop(i)
+                        return
+            time.sleep(0.001)
+        raise TimeoutError("Barrier timeout")
+
 
 def progress_until_done(requests, comm, timeout=30.0):
     start = time.time()
@@ -313,6 +330,9 @@ if __name__ == "__main__":
 
     send_tensor = torch.ones(args.tensor_size, dtype=torch.float32, device="cuda")
     recv_tensor = torch.zeros(args.tensor_size, dtype=torch.float32, device="cuda")
+
+    # Synchronize before transfers
+    comm.barrier(peer_name)
 
     if args.bidirectional:
         logger.info(f"Bidirectional: {n} transfers each direction")
