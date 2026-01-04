@@ -111,6 +111,22 @@ class nixlMetaDesc : public nixlBasicDesc {
         }
 };
 
+class nixlRemoteMetaDesc : public nixlMetaDesc {
+public:
+    using nixlMetaDesc::nixlMetaDesc;
+
+    nixlRemoteMetaDesc(bool is_empty = false) : nixlMetaDesc(), is_empty_(is_empty) { }
+
+    [[nodiscard]] bool
+    isEmpty() const noexcept {
+        return is_empty_;
+    }
+
+private:
+    bool is_empty_;
+};
+
 typedef nixlDescList<nixlMetaDesc> nixl_meta_dlist_t;
+typedef nixlDescList<nixlRemoteMetaDesc> nixl_remote_meta_dlist_t;
 
 #endif

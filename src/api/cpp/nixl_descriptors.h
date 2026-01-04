@@ -189,6 +189,85 @@ public:
 };
 
 /**
+ * @class nixlRemoteDesc
+ * @brief A descriptor class for remote buffers, with agent name bundled with a nixlBasicDesc.
+ */
+class nixlRemoteDesc : public nixlBasicDesc {
+public:
+    /** @var Reuse parent constructor without the agent name */
+    using nixlBasicDesc::nixlBasicDesc;
+
+    nixlRemoteDesc(bool is_empty = false);
+
+    /**
+     * @brief Parametrized constructor for nixlRemoteDesc
+     *
+     * @param addr        Start of buffer/block/offset-in-file
+     * @param len         Length of buffer
+     * @param devID       deviceID/BlockID/bufferID (remote ID)
+     * @param agent_name  Remote agent name
+     */
+    nixlRemoteDesc(const uintptr_t &addr,
+                   const size_t &len,
+                   const uint64_t &dev_id,
+                   const nixl_blob_t &agent_name);
+
+    /**
+     * @brief Constructor for nixlRemoteDesc from nixlBasicDesc and agent name
+     *
+     * @param desc        nixlBasicDesc object
+     * @param agent_name  Remote agent name
+     */
+    nixlRemoteDesc(const nixlBasicDesc &desc, const nixl_blob_t &agent_name);
+
+    /**
+     * @brief Deserializer constructor for nixlRemoteDesc with serialized blob
+     *
+     * @param str   Serialized blob from another nixlRemoteDesc
+     */
+    nixlRemoteDesc(const nixl_blob_t &str);
+
+    /**
+     * @brief Operator overloading (==) to compare nixlRemoteDesc objects
+     *
+     * @param lhs   nixlRemoteDesc object
+     * @param rhs   nixlRemoteDesc object
+     */
+    friend bool
+    operator==(const nixlRemoteDesc &lhs, const nixlRemoteDesc &rhs);
+
+    /**
+     * @brief Serialize nixlRemoteDesc to a blob
+     */
+    nixl_blob_t
+    serialize() const;
+
+    /**
+     * @brief Print nixlRemoteDesc for debugging purpose
+     *
+     * @param suffix gets prepended to the descriptor print
+     */
+    void
+    print(const std::string &suffix) const;
+
+    [[nodiscard]] nixl_blob_t
+    agentName() const noexcept {
+        return remoteAgent_;
+    }
+
+    [[nodiscard]] virtual bool
+    isEmpty() const noexcept {
+        return isEmpty_;
+    }
+
+private:
+    /** @var Remote agent name */
+    nixl_blob_t remoteAgent_;
+
+    bool isEmpty_;
+};
+
+/**
  * @class nixlDescList
  * @brief A class for describing a list of descriptors, as a template based on
  *        the nixlDesc type that is used.
@@ -375,5 +454,10 @@ using nixl_xfer_dlist_t = nixlDescList<nixlBasicDesc>;
  *        used for creating registratoin descriptor lists
  */
 using nixl_reg_dlist_t = nixlDescList<nixlBlobDesc>;
+/**
+ * @brief An alias for a nixlDescList<nixlRemoteDesc>
+ *        used for creating remote descriptor lists
+ */
+using nixl_remote_dlist_t = nixlDescList<nixlRemoteDesc>;
 
 #endif
