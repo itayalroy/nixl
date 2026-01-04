@@ -83,6 +83,7 @@ nixl_ep_cpp_args = [
     '-O3',
     '-DHAVE_CUDA',
     '-DTORCH_EXTENSION_NAME=nixl_ep_cpp',
+    '-DDISABLE_AGGRESSIVE_PTX_INSTRS',  # Match DeepEP default: use ld.volatile.global instead of L1::no_allocate
     '-Wno-deprecated-declarations',
     '-Wno-unused-variable',
     '-Wno-sign-compare',
@@ -93,6 +94,7 @@ nixl_ep_cpp_args = [
 nixl_ep_cuda_args = [
     '-DHAVE_CUDA',
     '-DTORCH_EXTENSION_NAME=nixl_ep_cpp',
+    '-DDISABLE_AGGRESSIVE_PTX_INSTRS',  # Match DeepEP default: use ld.volatile.global instead of L1::no_allocate
     '--expt-relaxed-constexpr',  # Allow calling constexpr __host__ functions from __device__ functions
     '-arch=sm_90',  # Only compile for sm90 (overrides global -gencode flags)
     '-rdc=true',
