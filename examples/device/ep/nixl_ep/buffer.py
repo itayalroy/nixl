@@ -267,6 +267,7 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
+        print(f"[NIXL_EP] dispatch: num_tokens={x.shape[0]}")
         (
             packed_recv_x,
             packed_recv_x_scales,
