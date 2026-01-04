@@ -99,7 +99,6 @@ nixl_ep_cuda_args = [
     '-Xcompiler', '-Wno-sign-compare',
     '-Xcompiler', '-Wno-reorder',
     '-Xcompiler', '-Wno-attributes',
-    '-DENABLE_FAST_DEBUG=1',
 ]
 
 # NVCC 12.9 workaround for bug (https://nvbugspro.nvidia.com/bug/5595631)
