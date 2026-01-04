@@ -80,6 +80,7 @@ if doca_gpunetio_dep.found()
 endif
 
 nixl_ep_cpp_args = [
+    '-O3',
     '-DHAVE_CUDA',
     '-DTORCH_EXTENSION_NAME=nixl_ep_cpp',
     '-Wno-deprecated-declarations',
@@ -94,13 +95,15 @@ nixl_ep_cuda_args = [
     '-DTORCH_EXTENSION_NAME=nixl_ep_cpp',
     '--expt-relaxed-constexpr',  # Allow calling constexpr __host__ functions from __device__ functions
     '-arch=sm_90',  # Only compile for sm90 (overrides global -gencode flags)
+    '-rdc=true',
+    '-O3',
     '--ptxas-options=--register-usage-level=10',  # Allow more register usage (matches setup.py)
+    '-Xcompiler', '-O3',
     '-Xcompiler', '-Wno-deprecated-declarations',
     '-Xcompiler', '-Wno-unused-variable',
     '-Xcompiler', '-Wno-sign-compare',
     '-Xcompiler', '-Wno-reorder',
     '-Xcompiler', '-Wno-attributes',
-    '-DENABLE_FAST_DEBUG=1',
 ]
 
 topk_idx_bits = meson.get_external_property('topk_idx_bits', '64')
