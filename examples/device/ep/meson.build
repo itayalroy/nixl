@@ -109,17 +109,13 @@ if nvcc.version().version_compare('>=12.9') and nvcc.version().version_compare('
     nixl_ep_cuda_args += ['-D_LIBCUDACXX_ATOMIC_UNSAFE_AUTOMATIC_STORAGE']
 endif
 
+# Add line info (enables file:line in cuda-gdb backtraces and compute-sanitizer)
+nixl_ep_cuda_args += ['-lineinfo']
+
 nixl_ep_rpath = torch_lib_dir
 nixl_ep_rpath += ':' + nixl_lib_dir
 nixl_ep_rpath += ':' + join_paths(nixl_lib_dir, 'core')
 nixl_ep_rpath += ':' + join_paths(nixl_lib_dir, 'plugins')
-
-# For now, nixl ep cannot be built with -G due to register usage limits
-nixl_ep_override_options = []
-if get_option('buildtype') == 'debug'
-    nixl_ep_override_options = ['optimization=3']
-    nixl_ep_cpp_args += ['-g']
-endif
 
 nixl_ep_install_rpath = join_paths(get_option('prefix'), get_option('libdir'))
 nixl_ep_install_rpath += ':' + join_paths(get_option('prefix'), get_option('libdir'), 'plugins')
@@ -140,7 +136,6 @@ nixl_ep_ext = py.extension_module('nixl_ep_cpp',
     link_with: [nixl_lib],
     build_rpath: nixl_ep_rpath,
     install_rpath: nixl_ep_install_rpath,
-    override_options: nixl_ep_override_options,
     install: true,
 )
 
