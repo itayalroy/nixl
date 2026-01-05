@@ -18,6 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from contextlib import contextmanager
 from datetime import timedelta
@@ -288,6 +289,14 @@ class Buffer:
             async_finish,
             return_recv_hook,
         )
+        
+        # Stats collection
+        if os.environ.get("NIXL_EP_COLLECT_STATS", "0") == "1":
+            self._collect_dispatch_stats(
+                topk_idx, num_experts, num_max_dispatch_tokens_per_rank,
+                packed_recv_x, packed_recv_count, packed_recv_layout_range
+            )
+        
         handle = (
             packed_recv_src_info,
             packed_recv_layout_range,
@@ -312,6 +321,62 @@ class Buffer:
             EventOverlap(event, tensors_to_record if async_finish else None),
             hook,
         )
+
+    def _collect_dispatch_stats(
+        self,
+        topk_idx: torch.Tensor,
+        num_experts: int,
+        num_max_dispatch_tokens_per_rank: int,
+        packed_recv_x: torch.Tensor,
+        packed_recv_count: torch.Tensor,
+        packed_recv_layout_range: torch.Tensor,
+    ) -> None:
+        """Collect dispatch statistics for debugging."""
+        if not hasattr(self, "_dispatch_stats"):
+            self._dispatch_stats = []
+            self._dispatch_call_idx = 0
+        
+        num_ranks = self.group_size
+        num_local_experts = num_experts // num_ranks
+        
+        # Compute dest_expert -> num_tokens
+        flat_topk = topk_idx.flatten()
+        valid_mask = flat_topk >= 0
+        valid_experts = flat_topk[valid_mask]
+        dest_expert_counts = {}
+        if valid_experts.numel() > 0:
+            unique, counts = valid_experts.unique(return_counts=True)
+            for e, c in zip(unique.tolist(), counts.tolist()):
+                dest_expert_counts[int(e)] = int(c)
+        
+        # Get tokens received from each src_rank (from layout_range)
+        # layout_range shape: [num_local_experts, num_ranks], contains (count, start_idx) packed
+        tokens_from_src_rank = {}
+        recv_count_cpu = packed_recv_count.cpu().tolist()
+        
+        stats = {
+            "call_idx": self._dispatch_call_idx,
+            "num_experts": num_experts,
+            "num_local_experts": num_local_experts,
+            "num_ranks": num_ranks,
+            "num_max_tokens_per_rank": num_max_dispatch_tokens_per_rank,
+            "topk_idx_min": int(topk_idx.min().item()),
+            "topk_idx_max": int(topk_idx.max().item()),
+            "topk_idx_shape": list(topk_idx.shape),
+            "dest_expert_counts": dest_expert_counts,
+            "recv_x_shape": list(packed_recv_x.shape),
+            "recv_count_per_expert": recv_count_cpu,
+            "total_tokens_sent": int(valid_experts.numel()),
+            "total_tokens_recv": sum(recv_count_cpu),
+        }
+        
+        self._dispatch_stats.append(stats)
+        self._dispatch_call_idx += 1
+        
+        # Save to file every call
+        stats_file = f"rank_{self.rank}_stats.json"
+        with open(stats_file, "w") as f:
+            json.dump(self._dispatch_stats, f, indent=2)
 
     # noinspection PyTypeChecker
     def combine(
