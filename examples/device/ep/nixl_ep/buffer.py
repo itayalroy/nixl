@@ -344,16 +344,43 @@ class Buffer:
         max_recv = max(recv_counts)
         total_recv = sum(recv_counts)
         
-        # call_idx,num_experts,num_local,max_tokens,topk_min,topk_max,max_recv,total_recv
         stats_file = f"rank_{self.rank}_stats.csv"
         mode = "a" if self._dispatch_call_idx > 0 else "w"
         with open(stats_file, mode) as f:
             if self._dispatch_call_idx == 0:
-                f.write("call_idx,num_experts,num_local,max_tokens,topk_min,topk_max,max_recv,total_recv\n")
+                f.write("call_idx,num_experts,num_local,max_tokens,topk_min,topk_max\n")
             num_local = num_experts // self.group_size
-            f.write(f"{self._dispatch_call_idx},{num_experts},{num_local},{num_max_dispatch_tokens_per_rank},{topk_min},{topk_max},{max_recv},{total_recv}\n")
+            f.write(f"{self._dispatch_call_idx},{num_experts},{num_local},{num_max_dispatch_tokens_per_rank},{topk_min},{topk_max}\n")
         
         self._dispatch_call_idx += 1
+
+    def _collect_combine_stats(
+        self,
+        x: torch.Tensor,
+        topk_idx: torch.Tensor,
+        num_experts: int,
+        num_max_dispatch_tokens_per_rank: int,
+        combined_x: torch.Tensor,
+    ) -> None:
+        """Collect combine statistics for debugging."""
+        if torch.cuda.is_current_stream_capturing():
+            return
+        
+        if not hasattr(self, "_combine_call_idx"):
+            self._combine_call_idx = 0
+        
+        topk_min = int(topk_idx.min().item())
+        topk_max = int(topk_idx.max().item())
+        
+        stats_file = f"rank_{self.rank}_combine_stats.csv"
+        mode = "a" if self._combine_call_idx > 0 else "w"
+        with open(stats_file, mode) as f:
+            if self._combine_call_idx == 0:
+                f.write("call_idx,num_experts,num_local,x_shape,topk_min,topk_max,out_shape\n")
+            num_local = num_experts // self.group_size
+            f.write(f"{self._combine_call_idx},{num_experts},{num_local},{list(x.shape)},{topk_min},{topk_max},{list(combined_x.shape)}\n")
+        
+        self._combine_call_idx += 1
 
     # noinspection PyTypeChecker
     def combine(
@@ -423,6 +450,13 @@ class Buffer:
             return_recv_hook,
             out,
         )
+        
+        # Stats collection for combine
+        if os.environ.get("NIXL_EP_COLLECT_STATS", "0") == "1":
+            self._collect_combine_stats(
+                x, topk_idx, num_experts, num_max_dispatch_tokens_per_rank, combined_x
+            )
+        
         tensors_to_record = (
             x,
             topk_idx,
