@@ -340,14 +340,18 @@ class Buffer:
         
         topk_min = int(topk_idx.min().item())
         topk_max = int(topk_idx.max().item())
+        recv_counts = packed_recv_count.tolist()
+        max_recv = max(recv_counts)
+        total_recv = sum(recv_counts)
         
-        # One line per dispatch: call_idx,num_experts,topk_min,topk_max,topk_shape
+        # call_idx,num_experts,num_local,max_tokens,topk_min,topk_max,max_recv,total_recv
         stats_file = f"rank_{self.rank}_stats.csv"
         mode = "a" if self._dispatch_call_idx > 0 else "w"
         with open(stats_file, mode) as f:
             if self._dispatch_call_idx == 0:
-                f.write("call_idx,num_experts,topk_min,topk_max,topk_shape\n")
-            f.write(f"{self._dispatch_call_idx},{num_experts},{topk_min},{topk_max},{list(topk_idx.shape)}\n")
+                f.write("call_idx,num_experts,num_local,max_tokens,topk_min,topk_max,max_recv,total_recv\n")
+            num_local = num_experts // self.group_size
+            f.write(f"{self._dispatch_call_idx},{num_experts},{num_local},{num_max_dispatch_tokens_per_rank},{topk_min},{topk_max},{max_recv},{total_recv}\n")
         
         self._dispatch_call_idx += 1
 
