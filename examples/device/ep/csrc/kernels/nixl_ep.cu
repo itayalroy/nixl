@@ -235,8 +235,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
 
         // Check if we're sending too many tokens to one expert (impossible with 256 tokens per rank)
         if (num_tokens_sent > 256) {
-            printf("[NIXL_EP-DISPATCH] BUG-SEND: Rank %d sending %d tokens to expert %d (dst_rank %d, local_expert %d) - exceeds 256!\n",
-                   rank, num_tokens_sent, responsible_expert_idx, dst_rank, dst_expert_local_idx);
+            printf("[NIXL_EP-DISPATCH] BUG-SEND: Rank %d sending %d tokens to expert %d (dst_rank %d, local_expert %d) - exceeds 256! num_tokens=%d, num_topk=%d, num_experts=%d\n",
+                   rank, num_tokens_sent, responsible_expert_idx, dst_rank, dst_expert_local_idx, num_tokens, num_topk, num_experts);
         }
 
         // Wait local sends issued and send expert counts

@@ -267,6 +267,20 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
+        # Check for duplicate expert indices per token (would cause overcounting)
+        if not torch.cuda.is_current_stream_capturing():
+            num_tokens, num_topk = topk_idx.shape
+            for token_idx in range(num_tokens):
+                token_experts = topk_idx[token_idx].tolist()
+                # Filter out -1 (no expert selected)
+                valid_experts = [e for e in token_experts if e >= 0]
+                if len(valid_experts) != len(set(valid_experts)):
+                    # Found duplicates
+                    from collections import Counter
+                    counts = Counter(valid_experts)
+                    duplicates = {e: c for e, c in counts.items() if c > 1}
+                    print(f"[NIXL_EP-DISPATCH] BUG-TOPK: Rank {self.rank}, token {token_idx} has duplicate experts: {duplicates}, full topk={token_experts}")
+
         (
             packed_recv_x,
             packed_recv_x_scales,
