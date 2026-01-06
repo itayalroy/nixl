@@ -368,6 +368,19 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             }
         }
     }
+
+    // Verify token counts per local expert after all receives are complete
+    cg::this_grid().sync();
+    if (thread_id == 0 && sm_id < num_local_experts) {
+        const int total_tokens = packed_recv_count[sm_id];
+        if (total_tokens > 256) {
+            printf("[NIXL_EP-DISPATCH] ERROR: Rank %d, local_expert %d received %d tokens (exceeds 256)\n",
+                   rank, sm_id, total_tokens);
+        } else if (total_tokens == 255) {
+            printf("[NIXL_EP-DISPATCH] WARNING: Rank %d, local_expert %d received %d tokens (approaching limit)\n",
+                   rank, sm_id, total_tokens);
+        }
+    }
 }
 
 void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
