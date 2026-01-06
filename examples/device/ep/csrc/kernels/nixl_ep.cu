@@ -233,6 +233,12 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         const auto dst_expert_local_idx = responsible_expert_idx % num_local_experts;
         const auto num_tokens_sent = shared_num_tokens_sent_per_expert[responsible_expert_idx - sm_id * num_warp_groups];
 
+        // Check if we're sending too many tokens to one expert (impossible with 256 tokens per rank)
+        if (num_tokens_sent > 256) {
+            printf("[NIXL_EP-DISPATCH] BUG-SEND: Rank %d sending %d tokens to expert %d (dst_rank %d, local_expert %d) - exceeds 256!\n",
+                   rank, num_tokens_sent, responsible_expert_idx, dst_rank, dst_expert_local_idx);
+        }
+
         // Wait local sends issued and send expert counts
         while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2)
             ;
