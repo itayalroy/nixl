@@ -237,6 +237,26 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         if (num_tokens_sent > 256) {
             printf("[NIXL_EP-DISPATCH] BUG-SEND: Rank %d sending %d tokens to expert %d (dst_rank %d, local_expert %d) - exceeds 256! num_tokens=%d, num_topk=%d, num_experts=%d\n",
                    rank, num_tokens_sent, responsible_expert_idx, dst_rank, dst_expert_local_idx, num_tokens, num_topk, num_experts);
+            
+            // On-demand: check for duplicate expert indices in topk_idx for this expert
+            for (int t = 0; t < num_tokens; ++t) {
+                int count_for_expert = 0;
+                for (int k = 0; k < num_topk; ++k) {
+                    int expert_idx = static_cast<int>(topk_idx[t * num_topk + k]);
+                    if (expert_idx == responsible_expert_idx) {
+                        count_for_expert++;
+                    }
+                }
+                if (count_for_expert > 1) {
+                    printf("[NIXL_EP-DISPATCH] BUG-TOPK: Rank %d, token %d selects expert %d %d times! topk=[",
+                           rank, t, responsible_expert_idx, count_for_expert);
+                    for (int k = 0; k < num_topk; ++k) {
+                        printf("%d", static_cast<int>(topk_idx[t * num_topk + k]));
+                        if (k < num_topk - 1) printf(", ");
+                    }
+                    printf("]\n");
+                }
+            }
         }
 
         // Wait local sends issued and send expert counts
