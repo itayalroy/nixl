@@ -267,6 +267,16 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
     if (phases & EP_SEND_PHASE)
         cg::this_grid().sync();
 
+    // Verify packed_recv_count is reset before processing
+    if (thread_id == 0 && sm_id < num_local_experts) {
+        int initial = packed_recv_count[sm_id];
+        if (initial != 0) {
+            printf("[NIXL_EP-DISPATCH] BUG: Rank %d, expert %d: packed_recv_count not reset! Initial=%d\n",
+                   rank, sm_id, initial);
+        }
+    }
+    __syncthreads();
+
     // Receiving and packing
     if (responsible_expert_idx < num_experts) {
         const auto src_rank = responsible_expert_idx / num_local_experts;
@@ -304,6 +314,12 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     }
                 }
                 current_value == 0 ? num_recv_tokens = 0 : num_recv_tokens = current_value - 1;
+            }
+
+            // Check if single source rank is sending too many tokens (impossible with 256 tokens per rank)
+            if (num_recv_tokens > 256) {
+                printf("[NIXL_EP-DISPATCH] BUG: Rank %d, expert %d, src_rank %d: num_recv_tokens=%d > 256 (impossible!)\n",
+                       rank, local_expert_idx, src_rank, num_recv_tokens);
             }
 
             // Mask rank if timeout
