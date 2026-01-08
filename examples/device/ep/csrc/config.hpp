@@ -33,7 +33,7 @@ dtype_t ceil_div(dtype_t a, dtype_t b) {
 }
 
 template <typename dtype_t>
-dtype_t align(dtype_t a, dtype_t b) {
+dtype_t align_up(dtype_t a, dtype_t b) {
     return ceil_div<dtype_t>(a, b) * b;
 }
 
@@ -97,7 +97,7 @@ struct EPLayout {
         total_bytes += recv_buffer_bytes * 2;
 
         // Symmetric signaling buffers
-        size_t dispatch_recv_count_buffer_bytes = num_experts * sizeof(int);
+        size_t dispatch_recv_count_buffer_bytes = num_experts * sizeof(uint64_t);
         size_t combine_recv_flag_buffer_bytes = dispatch_recv_count_buffer_bytes;
         size_t signaling_buffer_bytes = std::max(dispatch_recv_count_buffer_bytes, combine_recv_flag_buffer_bytes);
         size_t signaling_buffer_bytes_aligned = align<size_t>(signaling_buffer_bytes, 128);
@@ -108,7 +108,7 @@ struct EPLayout {
         // so you may see some parameters are duplicated
         for (int i = 0; i < 2; ++ i) {
             buffers[i] = {
-                static_cast<int>(signaling_buffer_bytes / sizeof(int)),
+                static_cast<int>(signaling_buffer_bytes / sizeof(uint64_t)),
                 advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * i),
                 advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * 2 + recv_buffer_bytes * i),
                 advance<int*>(rdma_buffer, signaling_buffer_bytes_aligned * i),

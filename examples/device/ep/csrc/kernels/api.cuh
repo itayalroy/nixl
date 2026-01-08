@@ -55,26 +55,6 @@ struct gpu_nixl_ctx {
         return (void *)(reinterpret_cast<uint64_t>(rdma_p2p_ptrs[dst_rank]) + batch_offset_get(ptr));
     }
 
-    /* Double buffering considerations are handled by nixl_ctx */
-    __device__ inline uint64_t *counter_p2p_ptr_get(int local_expert_idx, int dst_rank) {
-        if (counters_p2p_ptrs[dst_rank] == nullptr)
-            return nullptr;
-
-        return counters_p2p_ptrs[dst_rank] + (local_expert_idx * num_ranks + rank);
-    }
-
-    __device__ inline uint64_t *local_counter_get(int local_expert_idx, int src_rank) {
-        return &local_counters[local_expert_idx * num_ranks + src_rank];
-    }
-
-    __device__ inline nixlGpuXferReqH remote_counter_get(int dest_rank) {
-        return remote_counter_reqs[dest_rank];
-    }
-
-    __device__ inline size_t remote_counter_offset_get(int local_expert_idx) {
-        return (local_expert_idx * num_ranks + rank) * sizeof(uint64_t);
-    }
-
     __device__ inline nixlGpuXferReqH remote_barrier_get(int dest_rank) {
         return remote_barrier_reqs[dest_rank];
     }
@@ -89,14 +69,6 @@ struct gpu_nixl_ctx {
 
     __device__ inline size_t batch_offset_get(uint64_t ptr) {
         return ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr);
-    }
-
-    __device__ inline void clean_counters_warp(int lane_id) {
-#ifdef __CUDACC__
-        #pragma unroll
-#endif
-        for (int i = lane_id; i < num_ranks * num_local_experts; i += 32)
-            clean_counters[i] = 0;
     }
 };
 
