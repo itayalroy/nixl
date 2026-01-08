@@ -245,7 +245,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 nixlGpuXferReqH xfer = nixl_ctx.batch_get(dst_rank);
                 EP_DEVICE_ASSERT(nixlGpuPostSignalXferReq<nixl_gpu_level_t::THREAD>(xfer, 0, num_tokens_sent + 1, nixl_ctx.batch_offset_get(dst_ptr), dst_expert_local_idx % nixl_ctx.num_channels) == NIXL_IN_PROG);
             } else {
-                st_release_sys_global(reinterpret_cast<uint64_t*>(dst_p2p_ptr), static_cast<uint64_t>(num_tokens_sent + 1));
+                st_release_sys_global(static_cast<uint64_t*>(dst_p2p_ptr), static_cast<uint64_t>(num_tokens_sent + 1));
             }
         }
 
@@ -788,13 +788,13 @@ combine(void* combined_x,
         if (sub_warp_id == 1 and lane_id == 0) {
             while (ld_acquire_global(atomic_clean_flag) == 0);
             auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx);
-            uint64_t *dst_p2p_ptr = nixl_ctx.rdma_p2p_ptr_get(dst_ptr, dst_rank);
+            auto dst_p2p_ptr = nixl_ctx.rdma_p2p_ptr_get(dst_ptr, dst_rank);
             if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
                 if (dst_p2p_ptr == 0) {
                     nixlGpuXferReqH xfer = nixl_ctx.batch_get(dst_rank);
                     EP_DEVICE_ASSERT(nixlGpuPostSignalXferReq<nixl_gpu_level_t::THREAD>(xfer, 0, 1, nixl_ctx.batch_offset_get(dst_ptr), local_expert_idx % nixl_ctx.num_channels) == NIXL_IN_PROG);
                 } else {
-                    st_release_sys_global(dst_p2p_ptr, 1);
+                    st_release_sys_global(static_cast<uint64_t*>(dst_p2p_ptr), 1);
                 }
             }
             atomic_add_release_global(atomic_clean_flag, -1);
