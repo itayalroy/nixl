@@ -157,7 +157,7 @@ void Buffer::init(int num_ranks, int64_t num_rdma_bytes)
 
     env_num_channels = std::getenv("NIXL_EP_NUM_CHANNELS") ? std::stoi(std::getenv("NIXL_EP_NUM_CHANNELS")) : 1;
     EP_HOST_ASSERT(env_num_channels > 0);
-    num_counters = env_num_channels * max_num_ranks * 2 + max_num_ranks;
+    num_counters = env_num_channels * max_num_ranks * 2;
     CUDA_CHECK(cudaMalloc(&rdma_buffer_ptr, num_rdma_bytes));
     CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, num_rdma_bytes));
     CUDA_CHECK(cudaMalloc(&counters_buffer_ptr, num_counters * sizeof(uint64_t)));
