@@ -100,7 +100,7 @@ struct EPLayout {
         size_t dispatch_recv_count_buffer_bytes = num_experts * sizeof(uint64_t);
         size_t combine_recv_flag_buffer_bytes = dispatch_recv_count_buffer_bytes;
         size_t signaling_buffer_bytes = std::max(dispatch_recv_count_buffer_bytes, combine_recv_flag_buffer_bytes);
-        size_t signaling_buffer_bytes_aligned = align<size_t>(signaling_buffer_bytes, 128);
+        size_t signaling_buffer_bytes_aligned = align_up<size_t>(signaling_buffer_bytes, 128);
         total_bytes += signaling_buffer_bytes_aligned * 2;
 
         // Assign pointers
