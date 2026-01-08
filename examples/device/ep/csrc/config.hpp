@@ -42,16 +42,16 @@ struct EPBuffer {
 
     void* dispatch_rdma_send_buffer = nullptr;
     void* dispatch_rdma_recv_data_buffer = nullptr;
-    int* dispatch_rdma_recv_count_buffer = nullptr;
+    uint64_t* dispatch_rdma_recv_count_buffer = nullptr;
 
     void* combine_rdma_send_buffer = nullptr;
     void* combine_rdma_recv_data_buffer = nullptr;
-    int* combine_rdma_recv_flag_buffer = nullptr;
+    uint64_t* combine_rdma_recv_flag_buffer = nullptr;
 
     void* combine_rdma_send_buffer_data_start = nullptr;
     size_t num_bytes_per_combine_msg = 0;
 
-    std::pair<int*, int> clean_meta() {
+    std::pair<uint64_t*, int> clean_meta() {
         EP_HOST_ASSERT(dispatch_rdma_recv_count_buffer == combine_rdma_recv_flag_buffer);
         return {dispatch_rdma_recv_count_buffer, num_clean_int};
     }
@@ -111,10 +111,10 @@ struct EPLayout {
                 static_cast<int>(signaling_buffer_bytes / sizeof(uint64_t)),
                 advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * i),
                 advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * 2 + recv_buffer_bytes * i),
-                advance<int*>(rdma_buffer, signaling_buffer_bytes_aligned * i),
+                advance<uint64_t*>(rdma_buffer, signaling_buffer_bytes_aligned * i),
                 advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * i),
                 advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * 2 + recv_buffer_bytes * i),
-                advance<int*>(rdma_buffer, signaling_buffer_bytes_aligned * i),
+                advance<uint64_t*>(rdma_buffer, signaling_buffer_bytes_aligned * i),
                 advance(rdma_buffer, signaling_buffer_bytes_aligned * 2 + send_buffer_bytes * i),
                 num_bytes_per_combine_msg
             };
