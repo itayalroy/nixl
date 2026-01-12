@@ -80,15 +80,6 @@ struct NixlAgentInfo
     std::vector<bool> wire_up_done; // [num_peers]
 };
 
-struct nixl_ep_ctx {
-    std::vector<nixlXferReqH*> cpu_batch_reqs; // [num_peers]
-    std::vector<nixlGpuXferReqH> gpu_batch_reqs; // [num_peers]
-    std::vector<nixlXferReqH*> cpu_barrier_reqs; // [num_peers]
-    std::vector<nixlGpuXferReqH> gpu_barrier_reqs; // [num_peers]
-    std::vector<void *> rdma_p2p_ptrs; // [num_ranks]
-    ep_kernels::gpu_nixl_ctx gpu;
-};
-
 struct Buffer {
 private:
     int buffer_idx = 0; // Double buffering index
@@ -129,7 +120,7 @@ private:
     NixlPeerInfo my_peer_info;
     uint64_t max_num_ranks;
     int max_experts_per_rank;
-    std::unique_ptr<nixl_ep_ctx> nixl_ctx = nullptr;
+    ep_kernels::gpu_nixl_ctx gpu_ctx;
 
     /* Common private funcs */
     void _nixl_agent_init();
@@ -138,17 +129,11 @@ private:
     void _nixl_agents_peer_info_gather(std::vector<int>& ranks);
     void _nixl_agents_peer_info_cleanup(const std::vector<int>& ranks);
 
-    /* NIXL EP private funcs */
-    void _nixl_ep_init(const std::vector<int>& ranks);
-    void _nixl_ep_context_init();
-    void _nixl_ep_batches_prepare(const std::vector<int>& ranks);
-    void _nixl_ep_p2p_ptrs_prepare(const std::vector<int>& ranks);
-    void _nixl_ep_gpu_ctx_update();
-
-    /* NIXL EP cleanup funcs */
-    void _nixl_ep_cleanup(const std::vector<int>& ranks_to_remove);
-    void _nixl_ep_batches_cleanup(const std::vector<int>& ranks_to_remove);
-    void _nixl_ep_p2p_ptrs_cleanup(const std::vector<int>& ranks_to_remove);
+    /* NIXL EP init funcs */
+    void _nixl_ep_init(void);
+    void _nixl_ep_connect_ranks(const std::vector<int>& ranks);
+    void _nixl_ep_disconnect_ranks(const std::vector<int>& ranks);
+    void _nixl_ep_destroy(void);
 
 public:
     Buffer(int rank, bool explicitly_destroy, bool enable_shrink);

@@ -33,33 +33,17 @@ namespace nixl_ep {
 // EP kernels
 namespace ep_kernels {
 struct gpu_nixl_ctx {
-    nixlGpuXferReqH *batch_reqs; // [dest_rank]
-    nixlGpuXferReqH *remote_barrier_reqs; // [dest_rank]
+    nixlMemoryViewH local_mvh;
+    nixlMemoryViewH barrier_mvh;
+    nixlMemoryViewH remote_mvh;
     int *local_barrier_buffer; // [src_rank]
     int *local_barrier_cnt; // [dst_rank]
-    void **rdma_p2p_ptrs; // [num_ranks]
     void *rdma_buffer_ptr;
     int num_channels;
     int num_ranks;
     int rank;
 
-    /* Double buffering considerations are handled by the caller */
-    __device__ inline void *rdma_p2p_ptr_get(uint64_t ptr, int dst_rank) {
-        if (rdma_p2p_ptrs[dst_rank] == nullptr)
-            return nullptr;
-
-        return (void *)(reinterpret_cast<uint64_t>(rdma_p2p_ptrs[dst_rank]) + batch_offset_get(ptr));
-    }
-
-    __device__ inline nixlGpuXferReqH remote_barrier_get(int dest_rank) {
-        return remote_barrier_reqs[dest_rank];
-    }
-
-    __device__ inline nixlGpuXferReqH batch_get(int dest_rank) {
-        return batch_reqs[dest_rank];
-    }
-
-    __device__ inline size_t batch_offset_get(uint64_t ptr) {
+    __device__ inline size_t rdma_buffer_offset_get(uint64_t ptr) {
         return ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr);
     }
 };
