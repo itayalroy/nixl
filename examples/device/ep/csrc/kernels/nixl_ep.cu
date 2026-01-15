@@ -244,7 +244,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
             if (dst_p2p_ptr == 0) {
                 EP_DEVICE_ASSERT(nixlAtomicAdd(num_tokens_sent + 1, nixl_ctx.remote_mvh, (unsigned) dst_rank,
-                        nixl_ctx.rdma_buffer_offset_get(dst_ptr), dst_expert_local_idx % nixl_ctx.num_channels) == NIXL_IN_PROG);
+                        nixl_ctx.rdma_buffer_offset_get(dst_ptr), dst_expert_local_idx % nixl_ctx.num_channels, UCP_DEVICE_FLAG_NODELAY) == NIXL_IN_PROG);
             } else {
                 st_release_sys_global(static_cast<uint64_t*>(dst_p2p_ptr), static_cast<uint64_t>(num_tokens_sent + 1));
             }
@@ -794,7 +794,7 @@ combine(void* combined_x,
             if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
                 if (dst_p2p_ptr == 0) {
                     EP_DEVICE_ASSERT(nixlAtomicAdd(1, nixl_ctx.remote_mvh, (unsigned) dst_rank,
-                            nixl_ctx.rdma_buffer_offset_get(dst_ptr), local_expert_idx % nixl_ctx.num_channels) == NIXL_IN_PROG);
+                            nixl_ctx.rdma_buffer_offset_get(dst_ptr), local_expert_idx % nixl_ctx.num_channels, UCP_DEVICE_FLAG_NODELAY) == NIXL_IN_PROG);
                 } else {
                     st_release_sys_global(static_cast<uint64_t*>(dst_p2p_ptr), 1);
                 }
