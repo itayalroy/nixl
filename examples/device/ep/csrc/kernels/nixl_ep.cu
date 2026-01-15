@@ -176,7 +176,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     if (dst_p2p_ptr == 0) {
                         EP_DEVICE_ASSERT(nixlPut<nixl_gpu_level_t::WARP>(nixl_ctx.local_mvh, 0, nixl_ctx.rdma_buffer_offset_get(src_ptr),
                                 nixl_ctx.remote_mvh, (unsigned) dst_rank, nixl_ctx.rdma_buffer_offset_get(dst_ptr), num_bytes_per_msg,
-                                dst_expert_local_idx % nixl_ctx.num_channels, (slot_idx + 1) % 4 == 0) == NIXL_IN_PROG);
+                                dst_expert_local_idx % nixl_ctx.num_channels, (slot_idx + 1) % 4 == 0 ? UCP_DEVICE_FLAG_NODELAY : 0) == NIXL_IN_PROG);
                     } else {
                         // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
                         const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
@@ -778,7 +778,7 @@ combine(void* combined_x,
                 if (dst_p2p_ptr == 0) {
                     EP_DEVICE_ASSERT(nixlPut<nixl_gpu_level_t::WARP>(nixl_ctx.local_mvh, 0, nixl_ctx.rdma_buffer_offset_get(buf_ptr),
                             nixl_ctx.remote_mvh, (unsigned) dst_rank, nixl_ctx.rdma_buffer_offset_get(dst_ptr), num_send_bytes,
-                            local_expert_idx % nixl_ctx.num_channels, (token_idx - offset + 1) % 4 == 0) == NIXL_IN_PROG);
+                            local_expert_idx % nixl_ctx.num_channels, (token_idx - offset + 1) % 4 == 0 ? UCP_DEVICE_FLAG_NODELAY : 0) == NIXL_IN_PROG);
                 }
             }
         }
