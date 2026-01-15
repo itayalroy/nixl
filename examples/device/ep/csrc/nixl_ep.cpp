@@ -674,8 +674,8 @@ void Buffer::_nixl_ep_connect_ranks(const std::vector<int>& ranks) {
     std::unordered_set<int> remote_set(remote_ranks.begin(), remote_ranks.end());
     for (int r = 0; r < max_num_ranks; r++) {
         bool valid = remote_set.count(r);
-        remote_descs.addDesc(nixlRemoteDesc(valid ? (uintptr_t)nixl_peer_info[r].rdma_buffer_ptr : 0, valid ? num_rdma_bytes : 0, valid ? nixl_peer_info[r].device_id : 0, valid ? nixl_agent_info->remote_agent_names[r] : ""));
-        barrier_descs.addDesc(nixlRemoteDesc(valid ? (uintptr_t)nixl_peer_info[r].sync_buffer_ptr : 0, valid ? (max_num_ranks * sizeof(int)) : 0, valid ? nixl_peer_info[r].device_id : 0, valid ? nixl_agent_info->remote_agent_names[r] : ""));
+        remote_descs.addDesc(valid ? nixlRemoteDesc((uintptr_t)nixl_peer_info[r].rdma_buffer_ptr, num_rdma_bytes, nixl_peer_info[r].device_id, nixl_agent_info->remote_agent_names[r]) : nixlRemoteDesc(true));
+        barrier_descs.addDesc(valid ? nixlRemoteDesc((uintptr_t)nixl_peer_info[r].sync_buffer_ptr, max_num_ranks * sizeof(int), nixl_peer_info[r].device_id, nixl_agent_info->remote_agent_names[r]) : nixlRemoteDesc(true));
     }
 
     nixl_opt_args_t opt_args;
