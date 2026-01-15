@@ -315,6 +315,7 @@ DISPATCH_RECV:
             }
 
             num_recv_tokens = num_recv_tokens - 1;
+            printf("[rank %d] local_expert_idx: %d, src_rank: %d, num_recv_tokens: %d\n", rank, local_expert_idx, src_rank, num_recv_tokens);
             recv_token_begin_idx = atomicAdd(packed_recv_count + local_expert_idx, num_recv_tokens);
             shared_num_recv_tokens[warp_group_id] = num_recv_tokens;
             shared_recv_token_begin_idx[warp_group_id] = recv_token_begin_idx;
