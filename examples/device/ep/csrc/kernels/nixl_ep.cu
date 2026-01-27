@@ -34,6 +34,19 @@ namespace nixl_ep {
 
 namespace ep_kernels {
 
+__device__ inline size_t gpu_nixl_ctx::offset_get(uint64_t ptr) {
+    return ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr);
+}
+
+__device__ inline void* gpu_nixl_ctx::p2p_ptr_get(uint64_t dst_ptr, int dst_rank) {
+    if (dst_rank == rank) return (void*) dst_ptr;
+
+    void *remote_ptr = nixlGetPtr(remote_mvh, dst_rank);
+    if (remote_ptr == nullptr) return nullptr;
+
+    return (void*) ((uint64_t) remote_ptr + offset_get(dst_ptr));
+}
+
 template<bool use_warp_sync = false>
 __forceinline__ __device__ bool is_rank_masked(int* mask_buffer_ptr, int rank) {
     if (mask_buffer_ptr == nullptr) {
@@ -173,8 +186,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 void* dst_p2p_ptr = nixl_ctx.p2p_ptr_get(dst_ptr, dst_rank);
                 if (not is_rank_masked<true>(mask_buffer_ptr, dst_rank)) {
                     if (dst_p2p_ptr == 0) {
-                        nixlMemDesc src_mdesc{nixl_ctx.local_mvh, 0, nixl_ctx.rdma_buffer_offset_get(src_ptr)};
-                        nixlMemDesc dst_mdesc{nixl_ctx.remote_mvh, (size_t) dst_rank, nixl_ctx.rdma_buffer_offset_get(dst_ptr)};
+                        nixlMemDesc src_mdesc{nixl_ctx.local_mvh, 0, nixl_ctx.offset_get(src_ptr)};
+                        nixlMemDesc dst_mdesc{nixl_ctx.remote_mvh, (size_t) dst_rank, nixl_ctx.offset_get(dst_ptr)};
                         EP_DEVICE_ASSERT(nixlPut<nixl_gpu_level_t::WARP>(src_mdesc, dst_mdesc, num_bytes_per_msg,
                                 dst_expert_local_idx, (slot_idx + 1) % 4 == 0 ? UCP_DEVICE_FLAG_NODELAY : 0) == NIXL_IN_PROG);
                     } else {
@@ -242,7 +255,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         void* dst_p2p_ptr = nixl_ctx.p2p_ptr_get(dst_ptr, dst_rank);
         if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
             if (dst_p2p_ptr == 0) {
-                nixlMemDesc dst_mdesc{nixl_ctx.remote_mvh, (unsigned) dst_rank, nixl_ctx.rdma_buffer_offset_get(dst_ptr)};
+                nixlMemDesc dst_mdesc{nixl_ctx.remote_mvh, (unsigned) dst_rank, nixl_ctx.offset_get(dst_ptr)};
                 EP_DEVICE_ASSERT(nixlAtomicAdd(num_tokens_sent + 1, dst_mdesc, dst_expert_local_idx, UCP_DEVICE_FLAG_NODELAY) == NIXL_IN_PROG);
             } else {
                 st_release_sys_global(static_cast<uint64_t*>(dst_p2p_ptr), static_cast<uint64_t>(num_tokens_sent + 1));
@@ -774,8 +787,8 @@ combine(void* combined_x,
                 // Issue RDMA
                 // NOTES: for zero-copy mode, we assume the data is already in the send buffer
                 if (dst_p2p_ptr == 0) {
-                    nixlMemDesc src_mdesc{nixl_ctx.local_mvh, 0, nixl_ctx.rdma_buffer_offset_get(buf_ptr)};
-                    nixlMemDesc dst_mdesc{nixl_ctx.remote_mvh, (size_t) dst_rank, nixl_ctx.rdma_buffer_offset_get(dst_ptr)};
+                    nixlMemDesc src_mdesc{nixl_ctx.local_mvh, 0, nixl_ctx.offset_get(buf_ptr)};
+                    nixlMemDesc dst_mdesc{nixl_ctx.remote_mvh, (size_t) dst_rank, nixl_ctx.offset_get(dst_ptr)};
                     EP_DEVICE_ASSERT(nixlPut<nixl_gpu_level_t::WARP>(src_mdesc, dst_mdesc, num_send_bytes,
                             local_expert_idx, (token_idx - offset + 1) % 4 == 0 ? UCP_DEVICE_FLAG_NODELAY : 0) == NIXL_IN_PROG);
                 }
@@ -791,7 +804,7 @@ combine(void* combined_x,
             void* dst_p2p_ptr = nixl_ctx.p2p_ptr_get(dst_ptr, dst_rank);
             if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
                 if (dst_p2p_ptr == 0) {
-                    nixlMemDesc dst_mdesc{nixl_ctx.remote_mvh, (size_t) dst_rank, nixl_ctx.rdma_buffer_offset_get(dst_ptr)};
+                    nixlMemDesc dst_mdesc{nixl_ctx.remote_mvh, (size_t) dst_rank, nixl_ctx.offset_get(dst_ptr)};
                     EP_DEVICE_ASSERT(nixlAtomicAdd(1, dst_mdesc, local_expert_idx, UCP_DEVICE_FLAG_NODELAY) == NIXL_IN_PROG);
                 } else {
                     st_release_sys_global(static_cast<uint64_t*>(dst_p2p_ptr), 1);

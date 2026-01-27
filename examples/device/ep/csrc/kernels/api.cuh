@@ -27,9 +27,6 @@
 #include "nixl_types.h"
 #include "exception.cuh"
 #include "configs.cuh"
-#ifdef __CUDACC__
-#include "nixl_device.cuh"
-#endif
 
 namespace nixl_ep {
 
@@ -45,20 +42,8 @@ struct gpu_nixl_ctx {
     int max_num_ranks;
     int rank;
 
-#ifdef __CUDACC__
-    __device__ inline void* p2p_ptr_get(uint64_t dst_ptr, int dst_rank) {
-        if (dst_rank == rank) return (void*) dst_ptr;
-
-        void *remote_ptr = nixlGetPtr(remote_mvh, dst_rank);
-        if (remote_ptr == nullptr) return nullptr;
-
-        return (void*) ((uint64_t) remote_ptr + rdma_buffer_offset_get(dst_ptr));
-    }
-
-    __device__ inline size_t rdma_buffer_offset_get(uint64_t ptr) {
-        return ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr);
-    }
-#endif
+    __device__ inline size_t offset_get(uint64_t ptr);
+    __device__ inline void* p2p_ptr_get(uint64_t dst_ptr, int dst_rank);
 };
 
 void clean_buffer(int* clean_0, int num_clean_int_0,
