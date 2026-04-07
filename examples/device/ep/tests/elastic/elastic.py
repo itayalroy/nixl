@@ -19,14 +19,18 @@
 # limitations under the License.
 
 import argparse
+import json
 import os
 import random
+import shutil
 import signal
 import sys
+import tempfile
 import threading
 import time
+import traceback
 from functools import partial
-from typing import cast
+from typing import Any, cast
 
 import nixl_ep
 import rank_server
@@ -49,15 +53,113 @@ TCP_STORE_PORT = 9999
 RANK_SERVER_PORT = 10000
 
 
+def _write_worker_status(status_file: str | None, **updates: Any):
+    if status_file is None:
+        return
+
+    status = {}
+    if os.path.exists(status_file):
+        try:
+            with open(status_file, encoding="utf-8") as f:
+                status = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            status = {}
+
+    for key, value in updates.items():
+        if value is not None:
+            status[key] = value
+    status["updated_at"] = time.time()
+
+    tmp_status_file = f"{status_file}.tmp"
+    with open(tmp_status_file, "w", encoding="utf-8") as f:
+        json.dump(status, f, indent=2, sort_keys=True)
+    os.replace(tmp_status_file, status_file)
+
+
+def _read_worker_status(status_file: str) -> dict[str, Any]:
+    try:
+        with open(status_file, encoding="utf-8") as f:
+            return cast(dict[str, Any], json.load(f))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _format_worker_failure(
+    worker_idx: int, exitcode: int, status: dict[str, Any], status_file: str
+) -> str:
+    summary_parts = [f"worker={worker_idx}", f"exit_code={exitcode}"]
+    for key in (
+        "pid",
+        "torch_rank",
+        "global_rank",
+        "local_rank",
+        "current_phase",
+        "state",
+        "expected_kill",
+    ):
+        if key in status:
+            summary_parts.append(f"{key}={status[key]}")
+
+    lines = [", ".join(summary_parts)]
+
+    if "signal" in status:
+        lines.append(f"  signal={status['signal']}")
+
+    if "exception_type" in status:
+        exception_line = status["exception_type"]
+        if status.get("exception_message"):
+            exception_line = f"{exception_line}: {status['exception_message']}"
+        lines.append(f"  exception={exception_line}")
+
+    if status.get("traceback"):
+        lines.append("  traceback:")
+        lines.extend(
+            f"    {line}" for line in str(status["traceback"]).rstrip().splitlines()
+        )
+
+    lines.append(f"  status_file={status_file}")
+    return "\n".join(lines)
+
+
 def handle_sigterm(
     signum,
     frame,
     buffer: nixl_ep.Buffer,
     plan: Plan,
     rank_client: rank_server.RankClient,
+    status_file: str | None = None,
+    torch_rank: int | None = None,
+    global_rank: int | None = None,
+    local_rank: int | None = None,
 ):
+    current_phase = plan.get_phase() if plan is not None else None
+    expected_kill = (
+        plan is not None
+        and global_rank is not None
+        and global_rank in plan.get_killed_ranks()
+    )
+    _write_worker_status(
+        status_file,
+        state="sigterm",
+        signal=signum,
+        pid=os.getpid(),
+        torch_rank=torch_rank,
+        global_rank=global_rank,
+        local_rank=local_rank,
+        current_phase=current_phase,
+        expected_kill=expected_kill,
+    )
+    rank_fields = [
+        f"torch_rank={torch_rank}" if torch_rank is not None else None,
+        f"global_rank={global_rank}" if global_rank is not None else None,
+        f"local_rank={local_rank}" if local_rank is not None else None,
+        f"phase={current_phase}" if current_phase is not None else None,
+        f"expected_kill={expected_kill}",
+    ]
+    rank_desc = ", ".join(field for field in rank_fields if field is not None)
     print(
-        f"SIGTERM ({signum}) received for process {os.getpid()}! releasing rank and exiting...",
+        f"SIGTERM ({signum}) received for process {os.getpid()} "
+        f"({rank_desc})! releasing rank and exiting...",
         flush=True,
     )
     if plan is not None:
@@ -445,150 +547,238 @@ def test_main(
 
 def worker(torch_rank: int, args: argparse.Namespace):
     server_addr = args.tcp_server if args.tcp_server else "127.0.0.1"
-    rank_client = rank_server.RankClient(server_addr, RANK_SERVER_PORT)
-    local_rank, global_rank, last_active_phase = rank_client.get_rank()
-    plan = Plan(
-        args.plan,
-        global_rank,
-        start_phase=last_active_phase if last_active_phase is not None else 0,
+    status_file = os.path.join(args.worker_status_dir, f"worker_{torch_rank}.json")
+    rank_client = None
+    plan = None
+    buffer = None
+    global_rank = None
+    local_rank = None
+
+    _write_worker_status(
+        status_file,
+        state="starting",
+        pid=os.getpid(),
+        torch_rank=torch_rank,
     )
-    if plan.current_phase == -1:
-        print(
-            f"Process {torch_rank} -> no plan phases were found for rank {global_rank} after phase {last_active_phase}, exiting",
-            flush=True,
+
+    try:
+        rank_client = rank_server.RankClient(server_addr, RANK_SERVER_PORT)
+        local_rank, global_rank, last_active_phase = rank_client.get_rank()
+        plan = Plan(
+            args.plan,
+            global_rank,
+            start_phase=last_active_phase if last_active_phase is not None else 0,
         )
-        return
+        _write_worker_status(
+            status_file,
+            state="assigned_rank",
+            global_rank=global_rank,
+            local_rank=local_rank,
+            last_active_phase=last_active_phase,
+            current_phase=plan.get_phase(),
+        )
+        if plan.current_phase == -1:
+            print(
+                f"Process {torch_rank} -> no plan phases were found for rank {global_rank} after phase {last_active_phase}, exiting",
+                flush=True,
+            )
+            _write_worker_status(
+                status_file,
+                state="no_remaining_phases",
+                current_phase=plan.current_phase,
+            )
+            return
 
-    max_num_ranks = plan.get_max_rank() + 1
-    print(
-        f"Process {torch_rank} -> global_rank={global_rank}, local_rank={local_rank}",
-        flush=True,
-    )
-
-    # Initialize torch
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank % 8)
-    torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device("cuda")
-    torch.cuda.set_device(0)
-
-    tcp_store = store_group.create_client_store(
-        master_addr=server_addr,
-        port=TCP_STORE_PORT,
-    )
-
-    # Initialize nixl_ep buffer
-    num_rdma_bytes = nixl_ep.Buffer.get_rdma_size_hint(
-        args.num_tokens,
-        args.hidden_dim,
-        max_num_ranks,
-        args.num_experts_per_rank * max_num_ranks,
-    )
-    if local_rank == 0:
-        print(f"Allocating buffer size: {num_rdma_bytes / 1e6} MB ...", flush=True)
-
-    buffer = nixl_ep.Buffer(
-        rank=global_rank,
-        disable_ll_nvlink=args.disable_ll_nvlink,
-        explicitly_destroy=True,
-        tcp_store_group=tcp_store,
-    )
-    buffer.update_memory_buffers(
-        num_ranks=max_num_ranks,
-        num_experts_per_rank=args.num_experts_per_rank,
-        num_rdma_bytes=num_rdma_bytes,
-    )
-    signal.signal(
-        signal.SIGTERM,
-        partial(handle_sigterm, buffer=buffer, plan=plan, rank_client=rank_client),
-    )
-    remote_ranks = set()
-    mask_status = torch.zeros((max_num_ranks,), dtype=torch.int32, device="cuda")
-
-    while True:
+        max_num_ranks = plan.get_max_rank() + 1
         print(
-            f"global_rank={global_rank}, local_rank={local_rank} -> start phase {plan.get_phase()}",
+            f"Process {torch_rank} -> global_rank={global_rank}, local_rank={local_rank}",
             flush=True,
         )
 
-        added_ranks = plan.get_new_ranks()
-        cleanly_removed = plan.get_removed_ranks()
-        ranks_to_kill = plan.get_killed_ranks()
+        # Initialize torch
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank % 8)
+        torch.set_default_dtype(torch.bfloat16)
+        torch.set_default_device("cuda")
+        torch.cuda.set_device(0)
 
-        # If this rank is being removed in this phase, exit gracefully
-        if global_rank in cleanly_removed:
-            print(
-                f"global_rank={global_rank}, local_rank={local_rank} -> this rank is being removed in this phase, exiting",
-                flush=True,
-            )
-            rank_client.release_rank(user_context=plan.get_phase())
-            break
+        tcp_store = store_group.create_client_store(
+            master_addr=server_addr,
+            port=TCP_STORE_PORT,
+        )
 
-        if len(added_ranks) > 0:
-            print(
-                f"global_rank={global_rank}, local_rank={local_rank} -> adding connections to {added_ranks}",
-                flush=True,
-            )
-            buffer.connect_ranks(added_ranks)
-            remote_ranks.update(added_ranks)
-
-        # Check if this rank should be killed
-        kill_rank = global_rank in ranks_to_kill
-
-        if len(cleanly_removed) > 0:
-            print(
-                f"global_rank={global_rank}, local_rank={local_rank} -> removing connections to {cleanly_removed}",
-                flush=True,
-            )
-            buffer.disconnect_ranks(cleanly_removed)
-            remote_ranks.difference_update(cleanly_removed)
-            time.sleep(
-                5
-            )  # required to avoid race between MD invalidation and readdition of same ranks, if this is part of the test
-
-        # Use sparse num_ranks = max(active_ranks) + 1 for proper indexing
-        active_ranks_list = plan.get_active_ranks()
-        current_num_ranks = max(active_ranks_list) + 1  # Sparse indexing
-        current_num_experts = args.num_experts_per_rank * current_num_ranks
-
-        test_main(
+        # Initialize nixl_ep buffer
+        num_rdma_bytes = nixl_ep.Buffer.get_rdma_size_hint(
             args.num_tokens,
             args.hidden_dim,
-            current_num_experts,
-            args.num_topk,
-            global_rank,
-            current_num_ranks,
             max_num_ranks,
-            buffer,
-            kineto=args.kineto,
-            fault_tolerance_test=kill_rank,
+            args.num_experts_per_rank * max_num_ranks,
         )
-        # Query mask buffer to detect any unexpected rank failures and clean them up
-        buffer.query_mask_buffer(mask_status)
-        newly_failed_ranks = set()
-        for r in range(current_num_ranks):
-            if mask_status[r].item() != 0 and r in remote_ranks:
-                newly_failed_ranks.add(r)
+        if local_rank == 0:
+            print(f"Allocating buffer size: {num_rdma_bytes / 1e6} MB ...", flush=True)
 
-        if len(newly_failed_ranks) > 0:
+        buffer = nixl_ep.Buffer(
+            rank=global_rank,
+            disable_ll_nvlink=args.disable_ll_nvlink,
+            explicitly_destroy=True,
+            tcp_store_group=tcp_store,
+        )
+        buffer.update_memory_buffers(
+            num_ranks=max_num_ranks,
+            num_experts_per_rank=args.num_experts_per_rank,
+            num_rdma_bytes=num_rdma_bytes,
+        )
+        signal.signal(
+            signal.SIGTERM,
+            partial(
+                handle_sigterm,
+                buffer=buffer,
+                plan=plan,
+                rank_client=rank_client,
+                status_file=status_file,
+                torch_rank=torch_rank,
+                global_rank=global_rank,
+                local_rank=local_rank,
+            ),
+        )
+        remote_ranks = set()
+        mask_status = torch.zeros((max_num_ranks,), dtype=torch.int32, device="cuda")
+
+        while True:
+            current_phase = plan.get_phase()
             print(
-                f"global_rank={global_rank}, local_rank={local_rank} -> detected unexpected rank failures: {newly_failed_ranks}, cleaning up...",
+                f"global_rank={global_rank}, local_rank={local_rank} -> start phase {current_phase}",
                 flush=True,
             )
-            remote_ranks.difference_update(newly_failed_ranks)
-            buffer.disconnect_ranks(list(newly_failed_ranks))
-            time.sleep(5)
 
+            added_ranks = plan.get_new_ranks()
+            cleanly_removed = plan.get_removed_ranks()
+            ranks_to_kill = plan.get_killed_ranks()
+            kill_rank = global_rank in ranks_to_kill
+            _write_worker_status(
+                status_file,
+                state="running",
+                current_phase=current_phase,
+                added_ranks=added_ranks,
+                cleanly_removed=cleanly_removed,
+                ranks_to_kill=ranks_to_kill,
+                expected_kill=kill_rank,
+            )
+
+            # If this rank is being removed in this phase, exit gracefully
+            if global_rank in cleanly_removed:
+                print(
+                    f"global_rank={global_rank}, local_rank={local_rank} -> this rank is being removed in this phase, exiting",
+                    flush=True,
+                )
+                _write_worker_status(
+                    status_file,
+                    state="cleanly_removed",
+                    current_phase=current_phase,
+                )
+                rank_client.release_rank(user_context=plan.get_phase())
+                break
+
+            if len(added_ranks) > 0:
+                print(
+                    f"global_rank={global_rank}, local_rank={local_rank} -> adding connections to {added_ranks}",
+                    flush=True,
+                )
+                buffer.connect_ranks(added_ranks)
+                remote_ranks.update(added_ranks)
+
+            if len(cleanly_removed) > 0:
+                print(
+                    f"global_rank={global_rank}, local_rank={local_rank} -> removing connections to {cleanly_removed}",
+                    flush=True,
+                )
+                buffer.disconnect_ranks(cleanly_removed)
+                remote_ranks.difference_update(cleanly_removed)
+                time.sleep(
+                    5
+                )  # required to avoid race between MD invalidation and readdition of same ranks, if this is part of the test
+
+            # Use sparse num_ranks = max(active_ranks) + 1 for proper indexing
+            active_ranks_list = plan.get_active_ranks()
+            current_num_ranks = max(active_ranks_list) + 1  # Sparse indexing
+            current_num_experts = args.num_experts_per_rank * current_num_ranks
+
+            test_main(
+                args.num_tokens,
+                args.hidden_dim,
+                current_num_experts,
+                args.num_topk,
+                global_rank,
+                current_num_ranks,
+                max_num_ranks,
+                buffer,
+                kineto=args.kineto,
+                fault_tolerance_test=kill_rank,
+            )
+            # Query mask buffer to detect any unexpected rank failures and clean them up
+            buffer.query_mask_buffer(mask_status)
+            newly_failed_ranks = set()
+            for r in range(current_num_ranks):
+                if mask_status[r].item() != 0 and r in remote_ranks:
+                    newly_failed_ranks.add(r)
+
+            if len(newly_failed_ranks) > 0:
+                print(
+                    f"global_rank={global_rank}, local_rank={local_rank} -> detected unexpected rank failures: {newly_failed_ranks}, cleaning up...",
+                    flush=True,
+                )
+                _write_worker_status(
+                    status_file,
+                    state="cleaning_failed_ranks",
+                    current_phase=current_phase,
+                    newly_failed_ranks=sorted(newly_failed_ranks),
+                )
+                remote_ranks.difference_update(newly_failed_ranks)
+                buffer.disconnect_ranks(list(newly_failed_ranks))
+                time.sleep(5)
+
+            print(
+                f"global_rank={global_rank}, local_rank={local_rank} -> end phase {current_phase}",
+                flush=True,
+            )
+            _write_worker_status(
+                status_file,
+                state="phase_complete",
+                current_phase=current_phase,
+            )
+
+            if not plan.next():
+                break
+
+        buffer.destroy()
+        _write_worker_status(
+            status_file,
+            state="done",
+            current_phase=plan.get_phase(),
+        )
+        print(f"global_rank={global_rank}, local_rank={local_rank} -> done", flush=True)
+    except Exception as e:
+        current_phase = plan.get_phase() if plan is not None else None
+        formatted_traceback = traceback.format_exc()
+        _write_worker_status(
+            status_file,
+            state="exception",
+            pid=os.getpid(),
+            global_rank=global_rank,
+            local_rank=local_rank,
+            current_phase=current_phase,
+            exception_type=type(e).__name__,
+            exception_message=str(e),
+            traceback=formatted_traceback,
+        )
         print(
-            f"global_rank={global_rank}, local_rank={local_rank} -> end phase {plan.get_phase()}",
+            f"Unhandled exception in worker {torch_rank} "
+            f"(pid={os.getpid()}, global_rank={global_rank}, "
+            f"local_rank={local_rank}, phase={current_phase}):",
+            file=sys.stderr,
             flush=True,
         )
-
-        if not plan.next():
-            break
-
-    buffer.destroy()
-
-    print(f"global_rank={global_rank}, local_rank={local_rank} -> done", flush=True)
+        print(formatted_traceback, file=sys.stderr, flush=True)
+        raise
 
 
 def run_server():
@@ -626,6 +816,7 @@ def main():
     )
 
     args = parser.parse_args()
+    args.worker_status_dir = tempfile.mkdtemp(prefix="elastic-worker-status-")
 
     if not args.tcp_server:
         print("Starting TCPStore and rank server locally", flush=True)
@@ -635,6 +826,7 @@ def main():
 
     if args.num_processes == 1:
         worker(0, args)
+        shutil.rmtree(args.worker_status_dir, ignore_errors=True)
         return
 
     ctx = torch.multiprocessing.spawn(
@@ -650,11 +842,19 @@ def main():
     for i, p in enumerate(ctx.processes):
         p.join()
         if p.exitcode != 0:
-            failed.append((i, p.exitcode))
+            status_file = os.path.join(args.worker_status_dir, f"worker_{i}.json")
+            failed.append((i, p.exitcode, _read_worker_status(status_file), status_file))
     if failed:
-        raise RuntimeError(
-            f"Worker processes failed: {', '.join(f'worker {i} (exit code {code})' for i, code in failed)}"
+        failure_details = "\n\n".join(
+            _format_worker_failure(i, exitcode, status, status_file)
+            for i, exitcode, status, status_file in failed
         )
+        raise RuntimeError(
+            "Worker processes exited non-zero:\n"
+            f"{failure_details}\n\n"
+            f"Worker status directory: {args.worker_status_dir}"
+        )
+    shutil.rmtree(args.worker_status_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
