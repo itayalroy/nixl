@@ -28,14 +28,16 @@
 #endif
 
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <pybind11/pytypes.h>
-#include <torch/types.h>
+#include <functional>
 #include <optional>
 #include <tuple>
 #include <vector>
 #include <string>
 
 #include <memory>
+#include "stable_torch.hpp"
 #include "config.hpp"
 #include "event.hpp"
 #include "kernels/configs.cuh"
@@ -86,12 +88,12 @@ private:
     uint64_t timeout_ms = 30000;
 
     // NVLink Buffer
-    int64_t num_nvl_bytes;
+    int64_t num_nvl_bytes = 0;
     void* buffer_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
     void** buffer_ptrs_gpu = nullptr;
 
     // RDMA Buffer
-    int64_t num_rdma_bytes;
+    int64_t num_rdma_bytes = 0;
     void* rdma_buffer_ptr = nullptr;
 
     int *mask_buffer_ptr = nullptr;
@@ -106,16 +108,16 @@ private:
     std::unique_ptr<vmm_region> m_workspace_alloc;
 
     // Device info and communication
-    int device_id;
-    int num_device_sms;
+    int device_id = 0;
+    int num_device_sms = 0;
     uint64_t timeout_cycles = 0;
-    int rank, rdma_rank, nvl_rank;
-    int num_ranks, num_rdma_ranks, num_nvl_ranks;
+    int rank, rdma_rank = 0, nvl_rank = 0;
+    int num_ranks, num_rdma_ranks = 0, num_nvl_ranks = 0;
     std::vector<int> remote_ranks; /* global ranks */
     cudaIpcMemHandle_t ipc_handles[NUM_MAX_NVL_PEERS];
 
     // Stream for communication
-    at::cuda::CUDAStream comm_stream;
+    cudaStream_t comm_stream = nullptr;
 
     // After synchronization, this flag will be true
     bool available = false;
@@ -147,9 +149,9 @@ private:
     std::unique_ptr<NixlAgentInfo> nixl_agent_info;
     std::vector<NixlPeerInfo> nixl_peer_info;
     NixlPeerInfo my_peer_info;
-    int max_num_ranks;
-    int max_experts_per_rank;
-    nixl_ep::gpu_nixl_ctx gpu_ctx;
+    int max_num_ranks = 0;
+    int max_experts_per_rank = 0;
+    nixl_ep::gpu_nixl_ctx gpu_ctx{};
     nixl_ep::gpu_nixl_ctx* gpu_ctx_ptr = nullptr;
     uint64_t* last_ht_barrier_counter = nullptr;
     uint64_t* local_ht_barrier_counter = nullptr;
@@ -196,9 +198,9 @@ public:
 
     pybind11::bytearray get_local_ipc_handle() const;
 
-    torch::Tensor get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer = false) const;
+    torch::Tensor get_local_buffer_tensor(int64_t dtype_code, int64_t offset, bool use_rdma_buffer = false) const;
 
-    torch::Stream get_comm_stream() const;
+    uintptr_t get_comm_stream_handle() const;
 
 
     void destroy();
@@ -255,6 +257,8 @@ public:
     void clean_mask_buffer();
 
     std::string get_local_metadata() const;
+
+    uintptr_t handle_id() const;
 };
 
 } // namespace nixl_ep

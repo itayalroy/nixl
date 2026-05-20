@@ -20,46 +20,64 @@
  * limitations under the License.
  */
 
-#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
 #include <memory>
 
+#include "stable_torch.hpp"
 #include "kernels/exception.cuh"
 
 namespace nixl_ep {
 
 struct EventHandle {
-    std::shared_ptr<torch::Event> event;
+    std::shared_ptr<cudaEvent_t> event;
 
     EventHandle() {
-        event = std::make_shared<torch::Event>(torch::kCUDA);
-        event->record(at::cuda::getCurrentCUDAStream());
+        event = std::shared_ptr<cudaEvent_t>(new cudaEvent_t{}, [](cudaEvent_t* e) {
+            if (e != nullptr && *e != nullptr) {
+                cudaEventDestroy(*e);
+            }
+            delete e;
+        });
+        CUDA_CHECK(cudaEventCreateWithFlags(event.get(), cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventRecord(*event, get_current_cuda_stream()));
     }
 
-    explicit EventHandle(const at::cuda::CUDAStream& stream) {
-        event = std::make_shared<torch::Event>(torch::kCUDA);
-        event->record(stream);
+    explicit EventHandle(cudaStream_t stream) {
+        event = std::shared_ptr<cudaEvent_t>(new cudaEvent_t{}, [](cudaEvent_t* e) {
+            if (e != nullptr && *e != nullptr) {
+                cudaEventDestroy(*e);
+            }
+            delete e;
+        });
+        CUDA_CHECK(cudaEventCreateWithFlags(event.get(), cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventRecord(*event, stream));
     }
 
     EventHandle(const EventHandle& other) = default;
 
     void current_stream_wait() const {
-        at::cuda::getCurrentCUDAStream().unwrap().wait(*event);
+        CUDA_CHECK(cudaStreamWaitEvent(get_current_cuda_stream(), *event, 0));
     }
 };
 
-torch::Event create_event(const at::cuda::CUDAStream &s) {
-    auto event = torch::Event(torch::kCUDA);
-    event.record(s);
+cudaEvent_t create_event(cudaStream_t s) {
+    cudaEvent_t event;
+    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(event, s));
     return event;
 }
 
-void stream_wait(const at::cuda::CUDAStream& s_0, const at::cuda::CUDAStream& s_1) {
-    EP_HOST_ASSERT(s_0.id() != s_1.id());
-    s_0.unwrap().wait(create_event(s_1));
+void stream_wait(cudaStream_t s_0, cudaStream_t s_1) {
+    if (s_0 == s_1) {
+        return;
+    }
+    cudaEvent_t event = create_event(s_1);
+    CUDA_CHECK(cudaStreamWaitEvent(s_0, event, 0));
+    CUDA_CHECK(cudaEventDestroy(event));
 }
 
-void stream_wait(const at::cuda::CUDAStream& s, const EventHandle& event) {
-    s.unwrap().wait(*event.event);
+void stream_wait(cudaStream_t s, const EventHandle& event) {
+    CUDA_CHECK(cudaStreamWaitEvent(s, *event.event, 0));
 }
 
 } // namespace nixl_ep

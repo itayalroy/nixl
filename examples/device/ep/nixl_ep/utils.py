@@ -23,7 +23,31 @@ from typing import Any, Optional, Tuple
 import torch
 
 # noinspection PyUnresolvedReferences
-from .nixl_ep_cpp import EventHandle
+from . import nixl_ep_cpp
+
+
+class EventHandle:
+    def __init__(self, event_id: Optional[int] = None) -> None:
+        self._event_id = (
+            nixl_ep_cpp.create_event_handle() if event_id is None else int(event_id)
+        )
+
+    @property
+    def event_id(self) -> int:
+        return self._event_id
+
+    def current_stream_wait(self) -> None:
+        assert self._event_id != 0
+        nixl_ep_cpp.event_current_stream_wait(self._event_id)
+
+    def __del__(self) -> None:
+        event_id = getattr(self, "_event_id", 0)
+        if event_id:
+            try:
+                nixl_ep_cpp.release_event_handle(event_id)
+            except Exception:
+                pass
+            self._event_id = 0
 
 
 class EventOverlap:

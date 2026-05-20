@@ -30,14 +30,76 @@ import torch.distributed as dist
 from . import nixl_ep_cpp
 
 # noinspection PyUnresolvedReferences
-from .nixl_ep_cpp import Config, EventHandle
-from .utils import EventOverlap
+from .nixl_ep_cpp import Config
+from .utils import EventHandle, EventOverlap
 
 if TYPE_CHECKING:
     import mpi4py  # noqa: F401
 
 
 DEFAULT_TIMEOUT_MS = 30_000
+
+_DTYPE_TO_CODE = {
+    torch.uint8: 0,
+    torch.int8: 1,
+    torch.int16: 2,
+    torch.int32: 3,
+    torch.int: 3,
+    torch.int64: 4,
+    torch.long: 4,
+    torch.float16: 5,
+    torch.half: 5,
+    torch.float32: 6,
+    torch.float: 6,
+    torch.float64: 7,
+    torch.double: 7,
+    torch.bool: 11,
+    torch.bfloat16: 15,
+}
+if hasattr(torch, "float8_e4m3fn"):
+    _DTYPE_TO_CODE[torch.float8_e4m3fn] = 24
+
+
+def _event_id(event: Optional[EventHandle]) -> int:
+    return 0 if event is None else event.event_id
+
+
+def _wrap_event(event_id: int) -> Optional[EventHandle]:
+    return EventHandle(event_id) if event_id else None
+
+
+def _config_args(config: Config) -> Tuple[int, int, int, int, int]:
+    return (
+        config.num_sms,
+        config.num_max_nvl_chunked_send_tokens,
+        config.num_max_nvl_chunked_recv_tokens,
+        config.num_max_rdma_chunked_send_tokens,
+        config.num_max_rdma_chunked_recv_tokens,
+    )
+
+
+class _RecvHook:
+    def __init__(self, hook_id: int) -> None:
+        self._hook_id = int(hook_id)
+
+    def __call__(self) -> None:
+        if self._hook_id:
+            hook_id = self._hook_id
+            self._hook_id = 0
+            nixl_ep_cpp.run_hook(hook_id)
+
+    def __del__(self) -> None:
+        hook_id = getattr(self, "_hook_id", 0)
+        if hook_id:
+            try:
+                nixl_ep_cpp.release_hook(hook_id)
+            except Exception:
+                pass
+            self._hook_id = 0
+
+
+def _wrap_hook(hook_id: int) -> Optional[Callable[[], None]]:
+    return _RecvHook(hook_id) if hook_id else None
 
 
 class Buffer:
@@ -177,11 +239,9 @@ class Buffer:
         Returns:
             stream: the communication stream.
         """
-        ts: torch.Stream = self.runtime.get_comm_stream()
-        return torch.cuda.Stream(
-            stream_id=ts.stream_id,
-            device_index=ts.device_index,
-            device_type=ts.device_type,
+        return torch.cuda.ExternalStream(
+            self.runtime.get_comm_stream_handle(),
+            device=self.runtime.get_local_device_id(),
         )
 
     def get_local_buffer_tensor(
@@ -200,7 +260,9 @@ class Buffer:
             offset: the offset of the beginning element.
             use_rdma_buffer: whether to return the RDMA buffer.
         """
-        tensor = self.runtime.get_local_buffer_tensor(dtype, offset, use_rdma_buffer)
+        tensor = torch.ops.nixl_ep.get_local_buffer_tensor(
+            self.runtime.handle_id(), _DTYPE_TO_CODE[dtype], offset, use_rdma_buffer
+        )
         if size is None:
             return tensor
 
@@ -309,10 +371,11 @@ class Buffer:
             num_tokens_per_expert,
             is_token_in_rank,
             event,
-        ) = self.runtime.get_dispatch_layout(
+        ) = torch.ops.nixl_ep.get_dispatch_layout(
+            self.runtime.handle_id(),
             topk_idx,
             num_experts,
-            getattr(previous_event, "event", None),
+            _event_id(getattr(previous_event, "event", None)),
             async_finish,
             allocate_on_comm_stream,
         )
@@ -321,7 +384,7 @@ class Buffer:
             num_tokens_per_rdma_rank,
             num_tokens_per_expert,
             is_token_in_rank,
-            EventOverlap(event),
+            EventOverlap(_wrap_event(event)),
         )
 
     def clean_buffer(
@@ -409,7 +472,8 @@ class Buffer:
             packed_recv_layout_range,
             event,
             hook,
-        ) = self.runtime.dispatch(
+        ) = torch.ops.nixl_ep.dispatch(
+            self.runtime.handle_id(),
             x,
             topk_idx,
             cumulative_local_expert_recv_stats,
@@ -443,8 +507,8 @@ class Buffer:
             (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x,
             packed_recv_count,
             handle,
-            EventOverlap(event, tensors_to_record if async_finish else None),
-            hook,
+            EventOverlap(_wrap_event(event), tensors_to_record if async_finish else None),
+            _wrap_hook(hook),
         )
 
     def dispatch(self, *args, **kwargs):
@@ -503,7 +567,8 @@ class Buffer:
             hidden,
             num_experts,
         ) = handle
-        combined_x, event, hook = self.runtime.combine(
+        combined_x, event, hook = torch.ops.nixl_ep.combine(
+            self.runtime.handle_id(),
             x,
             topk_idx,
             topk_weights,
@@ -528,8 +593,8 @@ class Buffer:
         )
         return (
             combined_x,
-            EventOverlap(event, tensors_to_record if async_finish else None),
-            hook,
+            EventOverlap(_wrap_event(event), tensors_to_record if async_finish else None),
+            _wrap_hook(hook),
         )
 
     def combine(self, *args, **kwargs):
@@ -585,7 +650,8 @@ class Buffer:
             num_recv_tokens = recv_src_meta.size(0)
             num_rdma_recv_tokens = send_nvl_head.size(0)
             recv_x, recv_x_scales, _, _, _, _, _, _, _, _, _, _, _, _, event = (
-                self.runtime.ht_dispatch(
+                torch.ops.nixl_ep.ht_dispatch(
+                    self.runtime.handle_id(),
                     x,
                     x_scales,
                     topk_idx,
@@ -601,13 +667,13 @@ class Buffer:
                     gbl_channel_prefix_matrix,
                     recv_gbl_rank_prefix_sum,
                     expert_alignment,
-                    config,
-                    getattr(previous_event, "event", None),
+                    *_config_args(config),
+                    _event_id(getattr(previous_event, "event", None)),
                     async_finish,
                     allocate_on_comm_stream,
                 )
             )
-            return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(event)  # type: ignore[return-value]
+            return (recv_x, recv_x_scales) if x_scales is not None else recv_x, None, None, None, None, EventOverlap(_wrap_event(event))  # type: ignore[return-value]
         else:
             assert (
                 num_tokens_per_rank is not None
@@ -630,7 +696,8 @@ class Buffer:
                 send_rdma_head,
                 send_nvl_head,
                 event,
-            ) = self.runtime.ht_dispatch(
+            ) = torch.ops.nixl_ep.ht_dispatch(
+                self.runtime.handle_id(),
                 x,
                 x_scales,
                 topk_idx,
@@ -646,8 +713,8 @@ class Buffer:
                 None,
                 None,
                 expert_alignment,
-                config,
-                getattr(previous_event, "event", None),
+                *_config_args(config),
+                _event_id(getattr(previous_event, "event", None)),
                 async_finish,
                 allocate_on_comm_stream,
             )
@@ -669,7 +736,7 @@ class Buffer:
                 recv_topk_weights,
                 num_recv_tokens_per_expert_list,
                 handle,
-                EventOverlap(event),
+                EventOverlap(_wrap_event(event)),
             )
 
     # noinspection PyTypeChecker
@@ -707,7 +774,8 @@ class Buffer:
         bias_0, bias_1 = Buffer._unpack_bias(bias)
 
         # Launch the kernel
-        combined_x, combined_topk_weights, event = self.runtime.ht_combine(
+        combined_x, combined_topk_weights, event = torch.ops.nixl_ep.ht_combine(
+            self.runtime.handle_id(),
             x,
             topk_weights,
             bias_0,
@@ -719,12 +787,12 @@ class Buffer:
             gbl_channel_prefix_matrix,
             send_rdma_head,
             send_nvl_head,
-            config,
-            getattr(previous_event, "event", None),
+            *_config_args(config),
+            _event_id(getattr(previous_event, "event", None)),
             async_finish,
             allocate_on_comm_stream,
         )
-        return combined_x, combined_topk_weights, EventOverlap(event)
+        return combined_x, combined_topk_weights, EventOverlap(_wrap_event(event))
 
     def update_mask_buffer(self, rank_to_mask: int, mask: bool = False):
         """
@@ -743,7 +811,7 @@ class Buffer:
         Arguments:
             mask_status: `[num_ranks]` with `torch.int`, the mask status of each rank. `1` means mask and `0` means unmasked.
         """
-        self.runtime.query_mask_buffer(mask_status)
+        torch.ops.nixl_ep.query_mask_buffer(self.runtime.handle_id(), mask_status)
 
     def clean_mask_buffer(self):
         """
@@ -773,7 +841,8 @@ class Buffer:
             hidden,
             num_experts,
         ) = handle
-        return self.runtime.get_next_combine_buffer(
+        return torch.ops.nixl_ep.get_next_combine_buffer(
+            self.runtime.handle_id(),
             num_max_dispatch_tokens_per_rank, hidden, num_experts
         )
 
