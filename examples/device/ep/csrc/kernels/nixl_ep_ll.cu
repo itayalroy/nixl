@@ -191,25 +191,30 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
 
     // Expert counts
+    constexpr int kNumMaxWarps = 32;
     constexpr int kNumMaxWarpGroups = 32;
     __shared__ int shared_num_tokens_sent_per_expert[kNumMaxWarpGroups];
+    __shared__ int shared_num_tokens_sent_per_count_warp[kNumMaxWarps][kNumMaxWarpGroups];
+
+    constexpr int kNumElemsPerRead = sizeof(int4) / sizeof(nv_bfloat16);
+    constexpr int kHiddenBf16Int4 = kHidden / kNumElemsPerRead;
+    constexpr int kNumPrepWarpsPerToken = ceil_div(kHiddenBf16Int4, 32);
+    const auto num_send_warps = num_warps - 1;
+    const auto num_warps_per_token =
+            kNumPrepWarpsPerToken > num_topk ? kNumPrepWarpsPerToken : num_topk;
+    const auto num_parallel_tokens = num_send_warps / num_warps_per_token;
+    const auto num_effective_send_warps =
+            num_parallel_tokens > 1 ? num_parallel_tokens * num_warps_per_token :
+                                      min(num_warps_per_token, num_send_warps);
+    const auto num_count_warps = num_warps - num_effective_send_warps;
+    const auto count_barrier_id = num_parallel_tokens > 1 ? num_parallel_tokens + 1 : 2;
 
     // Sending phase
     if ((phases & EP_SEND_PHASE) == 0)
         goto DISPATCH_RECV;
 
-    // There are 2 kinds of warps in this part:
-    // 1. The first-kind warps for FP8 cast and sending top-k tokens
-    // 2. The last warp for reading `topk_idx` and count for per-expert information
-    if (warp_id < num_warps - 1) {
-        constexpr int kNumElemsPerRead = sizeof(int4) / sizeof(nv_bfloat16);
-        constexpr int kHiddenBf16Int4 = kHidden / kNumElemsPerRead;
-        constexpr int kNumPrepWarpsPerToken = ceil_div(kHiddenBf16Int4, 32);
-        const auto num_send_warps = num_warps - 1;
-        const auto num_warps_per_token =
-                kNumPrepWarpsPerToken > num_topk ? kNumPrepWarpsPerToken : num_topk;
-        const auto num_parallel_tokens = num_send_warps / num_warps_per_token;
-
+    // Send warps prepare/copy tokens. Any leftover warps help count `topk_idx`.
+    if (warp_id < num_effective_send_warps) {
         // Small hidden sizes leave many send warps idle, so shard this CTA by token.
         if (num_parallel_tokens > 1) {
             const auto token_group_id = warp_id / num_warps_per_token;
@@ -250,7 +255,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 }
             }
         } else {
-            const auto num_threads = num_send_warps * 32;
+            const auto num_threads = num_effective_send_warps * 32;
 
             for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
                 const auto x_int4 = static_cast<const int4*>(x) + token_idx * kHiddenBf16Int4;
@@ -283,20 +288,23 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 }
             }
         }
-    } else if (warp_id == num_warps - 1) {
+    } else {
         EP_DEVICE_ASSERT(num_sms > 1);
+        const auto count_warp_id = warp_id - num_effective_send_warps;
+        const auto count_thread_id = count_warp_id * 32 + lane_id;
+        const auto num_count_threads = num_count_warps * 32;
         if (sm_id == 0) {
             // The first SM is responsible for cleaning the next buffer
             #pragma unroll
-            for (int i = lane_id; i < num_next_clean_int; i += 32)
+            for (int i = count_thread_id; i < num_next_clean_int; i += num_count_threads)
                 next_clean[i] = 0;
 
             // Notify before executing `int_p`
-            __syncwarp();
             #pragma unroll
-            for (int i = lane_id; i < active_expert_bound; i += 32)
+            for (int i = count_thread_id; i < active_expert_bound; i += num_count_threads)
                 atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG);
         }
+        asm volatile("bar.sync %0, %1;" ::"r"(count_barrier_id), "r"(num_count_threads));
 
         // This SM should be responsible for some destination experts, read `topk_idx` for them
         int expert_count[kNumMaxWarpGroups] = {0};
@@ -305,19 +313,34 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
 
         // Per lane count
         #pragma unroll 8
-        for (int i = lane_id; i < num_tokens * num_topk; i += 32) {
+        for (int i = count_thread_id; i < num_tokens * num_topk; i += num_count_threads) {
             auto idx = static_cast<int>(__ldg(topk_idx + i));
             if (idx >= expert_begin_idx and idx < expert_end_idx)
                 expert_count[idx - expert_begin_idx]++;
         }
 
-        // Warp reduce
+        // Reduce within each count warp.
         #pragma unroll
         for (int i = expert_begin_idx; i < expert_end_idx; ++i) {
             auto sum = warp_reduce_sum(expert_count[i - expert_begin_idx]);
-            if (lane_id == 0) {
-                shared_num_tokens_sent_per_expert[i - expert_begin_idx] = sum;
-                atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum);
+            if (lane_id == 0)
+                shared_num_tokens_sent_per_count_warp[count_warp_id][i - expert_begin_idx] = sum;
+        }
+        asm volatile("bar.sync %0, %1;" ::"r"(count_barrier_id), "r"(num_count_threads));
+
+        // One count warp combines count-warp partials and publishes expected finish tags.
+        if (count_warp_id == 0) {
+            #pragma unroll
+            for (int i = expert_begin_idx; i < expert_end_idx; ++i) {
+                int sum = 0;
+                #pragma unroll
+                for (int j = lane_id; j < num_count_warps; j += 32)
+                    sum += shared_num_tokens_sent_per_count_warp[j][i - expert_begin_idx];
+                sum = warp_reduce_sum(sum);
+                if (lane_id == 0) {
+                    shared_num_tokens_sent_per_expert[i - expert_begin_idx] = sum;
+                    atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum);
+                }
             }
         }
     }
