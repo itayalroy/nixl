@@ -360,8 +360,9 @@ class Buffer:
                 `[num_local_experts]` and be typed as `torch.int`. This is useful for online service EP load balance
                 monitoring.
             dispatch_wait_recv_cost_stats: a cumulative time spent waiting to receive each token tensor for statistics,
-                which should have shape `[num_ranks, num_ranks]` and be typed as `torch.int64`.
-                This is useful for detecting and pre-cisely localizing slow anomalies.
+                which should be a 1-D tensor with at least one entry per active rank and be typed as `torch.int64`.
+                Extra entries may be used by internal diagnostics.
+                This is useful for detecting and precisely localizing slow anomalies.
             use_fp8: whether to enable FP8 casting, with this, the received data will be a tuple of FP8 tensor and scaling factors.
             round_scale: whether round the scaling factors into power of 2.
             use_ue8m0: whether use UE8M0 as scaling factor format (available only with `round_scale=True`).

@@ -1052,7 +1052,7 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
     if (dispatch_wait_recv_cost_stats.has_value()) {
         EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->scalar_type() == torch::kInt64);
         EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->dim() == 1 and dispatch_wait_recv_cost_stats->is_contiguous());
-        EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->size(0) == active_rank_bound);
+        EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->size(0) >= active_rank_bound);
     }
 
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
@@ -1102,6 +1102,9 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
 
     // Kernel launch
     auto next_clean_meta = next_buffer.clean_meta();
+    const int dispatch_wait_recv_cost_stats_len = dispatch_wait_recv_cost_stats.has_value()
+            ? static_cast<int>(dispatch_wait_recv_cost_stats->size(0))
+            : 0;
     auto launcher = [=, this](int phases) {
         ep_kernels::dispatch(packed_recv_x.data_ptr(), packed_recv_x_scales_ptr,
                                packed_recv_src_info.data_ptr<int>(), packed_recv_layout_range.data_ptr<int64_t>(),
@@ -1109,6 +1112,7 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
                                mask_buffer_ptr,
                                cumulative_local_expert_recv_stats.has_value() ? cumulative_local_expert_recv_stats->data_ptr<int>() : nullptr,
                                dispatch_wait_recv_cost_stats.has_value() ? dispatch_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
+                               dispatch_wait_recv_cost_stats_len,
                                buffer.dispatch_rdma_recv_data_buffer, buffer.dispatch_rdma_recv_count_buffer,
                                buffer.dispatch_rdma_send_buffer,
                               x.data_ptr(), topk_idx.data_ptr<topk_idx_t>(),

@@ -59,6 +59,28 @@ __device__ __forceinline__ uint64_t doorbell_flag(int idx) {
     return (idx + 1) % 4 == 0 ? 0 : nixl_gpu_flags::defer;
 }
 
+constexpr int kDispatchTimingNumStats = 12;
+constexpr int kDispatchTimingSendDone = 0;
+constexpr int kDispatchTimingSendPrep = 1;
+constexpr int kDispatchTimingSendIssue = 2;
+constexpr int kDispatchTimingSendIssueMax = 3;
+constexpr int kDispatchTimingCountScanDone = 4;
+constexpr int kDispatchTimingCtaSyncRelease = 5;
+constexpr int kDispatchTimingCountWait = 6;
+constexpr int kDispatchTimingCountReady = 7;
+constexpr int kDispatchTimingCountPublishDone = 8;
+constexpr int kDispatchTimingCountSamples = 9;
+constexpr int kDispatchTimingSendSamples = 10;
+constexpr int kDispatchTimingIssueSamples = 11;
+
+__device__ __forceinline__ void atomic_max_u64(int64_t* ptr, uint64_t value) {
+    atomicMax(reinterpret_cast<unsigned long long*>(ptr), static_cast<unsigned long long>(value));
+}
+
+__device__ __forceinline__ void atomic_add_u64(int64_t* ptr, uint64_t value) {
+    atomicAdd(reinterpret_cast<unsigned long long*>(ptr), static_cast<unsigned long long>(value));
+}
+
 template <bool kUseFP8, int kHidden, typename vec_t>
 __device__ __forceinline__ void stage_dispatch_token(const int4* x_int4, vec_t* rdma_x_vec,
                                                       float* rdma_x_scales, int thread_offset,
@@ -153,6 +175,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
          int* mask_buffer_ptr,
          int* cumulative_local_expert_recv_stats,
          int64_t* dispatch_wait_recv_cost_stats,
+         int dispatch_wait_recv_cost_stats_len,
          void* rdma_recv_x, uint64_t* rdma_recv_count, void* rdma_x,
          const void* x, const topk_idx_t* topk_idx,
          int* atomic_counter_per_expert, int* atomic_finish_counter_per_expert,
@@ -208,6 +231,12 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                                       min(num_warps_per_token, num_send_warps);
     const auto num_count_warps = num_warps - num_effective_send_warps;
     const auto count_barrier_id = num_parallel_tokens > 1 ? num_parallel_tokens + 1 : 2;
+    const auto send_start_time = clock64();
+    const auto record_dispatch_timing =
+            dispatch_wait_recv_cost_stats != nullptr and
+            dispatch_wait_recv_cost_stats_len >= active_expert_bound + kDispatchTimingNumStats;
+    auto dispatch_timing_stats =
+            record_dispatch_timing ? dispatch_wait_recv_cost_stats + active_expert_bound : nullptr;
 
     // Sending phase
     if ((phases & EP_SEND_PHASE) == 0)
@@ -215,6 +244,11 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
 
     // Send warps prepare/copy tokens. Any leftover warps help count `topk_idx`.
     if (warp_id < num_effective_send_warps) {
+        uint64_t send_prep_cycles = 0;
+        uint64_t send_issue_cycles = 0;
+        uint64_t send_issue_max_cycles = 0;
+        uint64_t send_issue_samples = 0;
+
         // Small hidden sizes leave many send warps idle, so shard this CTA by token.
         if (num_parallel_tokens > 1) {
             const auto token_group_id = warp_id / num_warps_per_token;
@@ -240,18 +274,30 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     token_thread_id == 0 ? (*rdma_x_src_idx = token_idx) : 0;
 
                     // FP8 cast
+                    const auto prep_start = record_dispatch_timing ? clock64() : 0;
                     stage_dispatch_token<kUseFP8, kHidden, vec_t>(x_int4, rdma_x_vec, rdma_x_scales,
                                                                    token_thread_id, num_token_threads,
                                                                    lane_id, round_scale);
                     asm volatile("bar.sync %0, %1;" ::"r"(token_group_id + 1), "r"(num_token_threads));
+                    if (record_dispatch_timing)
+                        send_prep_cycles += clock64() - prep_start;
 
                     // Issue NIXL sends
-                    if (dst_expert_idx >= 0)
+                    if (dst_expert_idx >= 0) {
+                        const auto issue_start = record_dispatch_timing ? clock64() : 0;
                         issue_dispatch_send(nixl_ctx, mask_buffer_ptr, atomic_counter_per_expert,
                                             atomic_finish_counter_per_expert, rdma_recv_x, rdma_x_src_idx,
                                             dst_expert_idx, active_expert_bound, active_rank_bound,
                                             num_max_dispatch_tokens_per_rank, num_local_experts, rank,
                                             num_bytes_per_msg, num_int4_per_msg, lane_id);
+                        if (record_dispatch_timing) {
+                            const auto issue_cycles = clock64() - issue_start;
+                            send_issue_cycles += issue_cycles;
+                            if (issue_cycles > send_issue_max_cycles)
+                                send_issue_max_cycles = issue_cycles;
+                            ++send_issue_samples;
+                        }
+                    }
                 }
             }
         } else {
@@ -273,20 +319,39 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 thread_id == 0 ? (*rdma_x_src_idx = token_idx) : 0;
 
                 // FP8 cast
+                const auto prep_start = record_dispatch_timing ? clock64() : 0;
                 stage_dispatch_token<kUseFP8, kHidden, vec_t>(x_int4, rdma_x_vec, rdma_x_scales,
                                                                thread_id, num_threads, lane_id,
                                                                round_scale);
                 asm volatile("bar.sync 1, %0;" ::"r"(num_threads));
+                if (record_dispatch_timing)
+                    send_prep_cycles += clock64() - prep_start;
 
                 // Issue NIXL sends
                 if (dst_expert_idx >= 0) {
+                    const auto issue_start = record_dispatch_timing ? clock64() : 0;
                     issue_dispatch_send(nixl_ctx, mask_buffer_ptr, atomic_counter_per_expert,
                                         atomic_finish_counter_per_expert, rdma_recv_x, rdma_x_src_idx,
                                         dst_expert_idx, active_expert_bound, active_rank_bound,
                                         num_max_dispatch_tokens_per_rank, num_local_experts, rank,
                                         num_bytes_per_msg, num_int4_per_msg, lane_id);
+                    if (record_dispatch_timing) {
+                        const auto issue_cycles = clock64() - issue_start;
+                        send_issue_cycles += issue_cycles;
+                        if (issue_cycles > send_issue_max_cycles)
+                            send_issue_max_cycles = issue_cycles;
+                        ++send_issue_samples;
+                    }
                 }
             }
+        }
+        if (record_dispatch_timing and lane_id == 0) {
+            atomic_max_u64(dispatch_timing_stats + kDispatchTimingSendDone, clock64() - send_start_time);
+            atomic_max_u64(dispatch_timing_stats + kDispatchTimingSendPrep, send_prep_cycles);
+            atomic_max_u64(dispatch_timing_stats + kDispatchTimingSendIssue, send_issue_cycles);
+            atomic_max_u64(dispatch_timing_stats + kDispatchTimingSendIssueMax, send_issue_max_cycles);
+            atomic_add_u64(dispatch_timing_stats + kDispatchTimingSendSamples, 1);
+            atomic_add_u64(dispatch_timing_stats + kDispatchTimingIssueSamples, send_issue_samples);
         }
     } else {
         EP_DEVICE_ASSERT(num_sms > 1);
@@ -343,8 +408,12 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 }
             }
         }
+        if (record_dispatch_timing and count_warp_id == 0 and lane_id == 0)
+            atomic_max_u64(dispatch_timing_stats + kDispatchTimingCountScanDone, clock64() - send_start_time);
     }
     __syncthreads();
+    if (record_dispatch_timing and thread_id == 0)
+        atomic_max_u64(dispatch_timing_stats + kDispatchTimingCtaSyncRelease, clock64() - send_start_time);
 
     // Issue count sends
     if (responsible_expert_idx < active_expert_bound and sub_warp_id == 0 and lane_id == 0) {
@@ -353,7 +422,14 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         const auto num_tokens_sent = shared_num_tokens_sent_per_expert[responsible_expert_idx - sm_id * num_warp_groups];
 
         // Wait local sends issued and send expert counts
+        const auto count_wait_start = clock64();
         while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
+        const auto count_wait_done = clock64();
+        if (record_dispatch_timing) {
+            atomic_max_u64(dispatch_timing_stats + kDispatchTimingCountWait, count_wait_done - count_wait_start);
+            atomic_max_u64(dispatch_timing_stats + kDispatchTimingCountReady, count_wait_done - send_start_time);
+            atomic_add_u64(dispatch_timing_stats + kDispatchTimingCountSamples, 1);
+        }
         auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + dst_expert_local_idx * active_rank_bound + rank);
         if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
             void* dst_p2p_ptr = p2p_ptr_get(nixl_ctx, dst_ptr, dst_rank);
@@ -372,6 +448,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         // Clean `packed_recv_count`
         if (dst_rank == 0)
             packed_recv_count[dst_expert_local_idx] = 0;
+        if (record_dispatch_timing)
+            atomic_max_u64(dispatch_timing_stats + kDispatchTimingCountPublishDone, clock64() - send_start_time);
     }
     __syncwarp();
 
@@ -492,6 +570,7 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               int* mask_buffer_ptr,
               int* cumulative_local_expert_recv_stats,
               int64_t* dispatch_wait_recv_cost_stats,
+              int dispatch_wait_recv_cost_stats_len,
               void* rdma_recv_x, uint64_t* rdma_recv_count, void* rdma_x,
               const void* x, const topk_idx_t* topk_idx,
               uint64_t* next_clean, int num_next_clean_int,
@@ -534,6 +613,7 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               mask_buffer_ptr, \
               cumulative_local_expert_recv_stats, \
               dispatch_wait_recv_cost_stats, \
+              dispatch_wait_recv_cost_stats_len, \
               rdma_recv_x, rdma_recv_count, rdma_x, \
               x, topk_idx, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \

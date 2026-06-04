@@ -48,6 +48,7 @@ from utils import (  # noqa: E402
 
 TCP_STORE_PORT = 9999
 RANK_SERVER_PORT = 10000
+DISPATCH_DEBUG_TIMING_SLOTS = 12
 
 
 def non_negative_int(value: str) -> int:
@@ -101,6 +102,7 @@ def test_main(
     seed: int = 0,
     kineto: bool = False,
     fault_tolerance_test: bool = False,
+    dispatch_debug_timing: bool = False,
 ):
     torch.manual_seed(seed + rank)
     torch.cuda.manual_seed(seed + rank)
@@ -384,6 +386,16 @@ def test_main(
         mat_0 @ mat_1
         hook()
 
+    dispatch_timing_stats = (
+        torch.zeros(
+            (num_experts + DISPATCH_DEBUG_TIMING_SLOTS,),
+            dtype=torch.int64,
+            device="cuda",
+        )
+        if dispatch_debug_timing
+        else None
+    )
+
     # noinspection PyShadowingNames
     def test_func(return_recv_hook: bool):
         recv_x, recv_count, handle, event, hook = buffer.dispatch(
@@ -392,6 +404,7 @@ def test_main(
             num_tokens,
             num_experts,
             cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+            dispatch_wait_recv_cost_stats=dispatch_timing_stats,
             use_fp8=True,
             async_finish=False,
             return_recv_hook=return_recv_hook,
@@ -422,12 +435,40 @@ def test_main(
         ) * num_selections
 
     # Dispatch + combine testing
+    if dispatch_timing_stats is not None:
+        dispatch_timing_stats.zero_()
     avg_t, min_t, max_t = bench(partial(test_func, return_recv_hook=False))
     print(
         f"[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, "
         f"avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us",
         flush=True,
     )
+    if dispatch_timing_stats is not None and rank == 0:
+        timing = dispatch_timing_stats[num_experts:].cpu().tolist()
+        clock_rate_khz = torch.cuda.get_device_properties(0).clock_rate
+
+        def format_cycles(cycles: int) -> str:
+            return f"{cycles} cyc/{cycles / clock_rate_khz * 1000:.2f} us"
+
+        timing_parts = [
+            f"send_done={format_cycles(timing[0])}",
+            f"send_prep={format_cycles(timing[1])}",
+            f"send_issue={format_cycles(timing[2])}",
+            f"send_issue_max={format_cycles(timing[3])}",
+            f"count_scan_done={format_cycles(timing[4])}",
+            f"cta_sync_release={format_cycles(timing[5])}",
+            f"count_wait={format_cycles(timing[6])}",
+            f"count_ready={format_cycles(timing[7])}",
+            f"count_publish_done={format_cycles(timing[8])}",
+            f"count_samples={timing[9]}",
+            f"send_samples={timing[10]}",
+            f"issue_samples={timing[11]}",
+        ]
+        print(
+            f"[rank {rank}] Dispatch debug timing (max over bench): "
+            + ", ".join(timing_parts),
+            flush=True,
+        )
 
     # Separate profiling
     if not kineto:
@@ -576,6 +617,7 @@ def worker(torch_rank: int, args: argparse.Namespace):
             buffer,
             kineto=args.kineto,
             fault_tolerance_test=kill_rank,
+            dispatch_debug_timing=args.dispatch_debug_timing,
         )
         # Query mask buffer to detect any unexpected rank failures and clean them up
         buffer.query_mask_buffer(mask_status)
@@ -644,6 +686,11 @@ def main():
         type=non_negative_int,
         default=DEFAULT_TIMEOUT_MS,
         help="GPU timeout in milliseconds (non-negative integer)",
+    )
+    parser.add_argument(
+        "--dispatch-debug-timing",
+        action="store_true",
+        help="Print one compact dispatch send timing summary per elastic phase",
     )
 
     args = parser.parse_args()
