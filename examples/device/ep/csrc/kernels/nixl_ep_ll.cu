@@ -32,15 +32,6 @@ namespace cg = cooperative_groups;
 
 namespace nixl_ep {
 
-__device__ inline void* p2p_ptr_get(gpu_nixl_ctx& ctx, uint64_t dst_ptr, int dst_rank) {
-    if (dst_rank == ctx.rank) return (void*) dst_ptr;
-
-    void *remote_ptr = ctx.p2p_ptrs == nullptr ? nixlGetPtr(ctx.remote_mvh, dst_rank) : ctx.p2p_ptrs[dst_rank];
-    if (remote_ptr == nullptr) return nullptr;
-
-    return (void*) ((uint64_t) remote_ptr + ctx.offset_get(dst_ptr));
-}
-
 namespace ep_kernels {
 
 template<bool use_warp_sync = false>
@@ -53,10 +44,6 @@ __forceinline__ __device__ bool is_rank_masked(int* mask_buffer_ptr, int rank) {
     } else {
         return ld_acquire_global(mask_buffer_ptr + rank) != 0;
     }
-}
-
-__device__ __forceinline__ uint64_t doorbell_flag(int idx) {
-    return (idx + 1) % 4 == 0 ? 0 : nixl_gpu_flags::defer;
 }
 
 template <bool kUseFP8, bool kUseUE8M0, int kHidden>
@@ -186,18 +173,15 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                                      rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                                      slot_idx * num_bytes_per_msg;
                 if (not is_rank_masked<true>(mask_buffer_ptr, dst_rank)) {
-                    void* dst_p2p_ptr = p2p_ptr_get(nixl_ctx, dst_ptr, dst_rank);
-                    if (dst_p2p_ptr == 0) {
-                        nixlMemViewElem src_mdesc{nixl_ctx.local_mvh, 0, nixl_ctx.offset_get(src_ptr)};
-                        nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh, (size_t) dst_rank, nixl_ctx.offset_get(dst_ptr)};
-                        EP_DEVICE_ASSERT(nixlPut<nixl_gpu_level_t::WARP>(src_mdesc, dst_mdesc, num_bytes_per_msg,
-                                dst_expert_local_idx, doorbell_flag(slot_idx)) == NIXL_IN_PROG);
-                    } else {
-                        // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
-                        const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
-                        const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
-                        UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
-                    }
+                    EP_DEVICE_ASSERT(nixl_ctx.p2p_ptrs != nullptr);
+                    void* dst_p2p_base = nixl_ctx.p2p_ptrs[dst_rank];
+                    EP_DEVICE_ASSERT(dst_p2p_base != nullptr);
+                    void* dst_p2p_ptr = reinterpret_cast<void*>(
+                            reinterpret_cast<uint64_t>(dst_p2p_base) + nixl_ctx.offset_get(dst_ptr));
+                    // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
+                    const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
+                    const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
+                    UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
                 }
 
                 // Increase counter after finishing
@@ -255,13 +239,12 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
         auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + dst_expert_local_idx * active_rank_bound + rank);
         if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
-            void* dst_p2p_ptr = p2p_ptr_get(nixl_ctx, dst_ptr, dst_rank);
-            if (dst_p2p_ptr == 0) {
-                nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh, static_cast<size_t>(dst_rank), nixl_ctx.offset_get(dst_ptr)};
-                EP_DEVICE_ASSERT(nixlAtomicAdd(num_tokens_sent + 1, dst_mdesc, dst_expert_local_idx) == NIXL_IN_PROG);
-            } else {
-                st_release_sys_global(static_cast<uint64_t*>(dst_p2p_ptr), static_cast<uint64_t>(num_tokens_sent + 1));
-            }
+            EP_DEVICE_ASSERT(nixl_ctx.p2p_ptrs != nullptr);
+            void* dst_p2p_base = nixl_ctx.p2p_ptrs[dst_rank];
+            EP_DEVICE_ASSERT(dst_p2p_base != nullptr);
+            void* dst_p2p_ptr = reinterpret_cast<void*>(
+                    reinterpret_cast<uint64_t>(dst_p2p_base) + nixl_ctx.offset_get(dst_ptr));
+            st_release_sys_global(static_cast<uint64_t*>(dst_p2p_ptr), static_cast<uint64_t>(num_tokens_sent + 1));
         }
 
         // Clean workspace for next use
@@ -722,19 +705,21 @@ combine(void* combined_x,
                 const auto rdma_send_type_row = reinterpret_cast<int*>(rdma_send_x_vec + token_idx * num_bytes_per_slot);
                 const auto rdma_send_x_vec_row = reinterpret_cast<uint8_t*>(rdma_send_type_row);
 
-                // Copy directly to local rank, or copy to buffer and issue RDMA
+                // Copy directly to local rank or cached peer mapping.
                 const auto src_idx = __shfl_sync(0xffffffff, __ldg(local_src_info + token_idx), 0);
                 const auto buf_ptr = reinterpret_cast<int64_t>(rdma_send_x_vec_row);
                 const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
                     (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot;
-                void* dst_p2p_ptr = p2p_ptr_get(nixl_ctx, dst_ptr, dst_rank);
-                int num_send_bytes = hidden * sizeof(nv_bfloat16);
+                EP_DEVICE_ASSERT(nixl_ctx.p2p_ptrs != nullptr);
+                void* dst_p2p_base = nixl_ctx.p2p_ptrs[dst_rank];
+                EP_DEVICE_ASSERT(dst_p2p_base != nullptr);
+                void* dst_p2p_ptr = reinterpret_cast<void*>(
+                        reinterpret_cast<uint64_t>(dst_p2p_base) + nixl_ctx.offset_get(dst_ptr));
 
-                if (not zero_copy or dst_p2p_ptr != 0) {
+                {
                     // Read from `cpy_src_int4_ptr` and copy into `cpy_dst_int4_ptr`
                     const auto cpy_src_int4_ptr = zero_copy ? reinterpret_cast<int4*>(buf_ptr) : x_int4;
-                    const auto cpy_dst_int4_ptr =
-                        dst_p2p_ptr == 0 ? reinterpret_cast<int4*>(buf_ptr) : reinterpret_cast<int4*>(dst_p2p_ptr);
+                    const auto cpy_dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
 
                     // Prefetch
                     if (elect_one_sync())
@@ -779,7 +764,6 @@ combine(void* combined_x,
 
                     // Store metadata (min/max values) for LogFMT
                     if constexpr (kUseLogFMT) {
-                        num_send_bytes = tma_offset_bytes;
                         if (elect_one_sync())
                             tma_store_1d(meta_buffers, cpy_dst_int4_ptr, kNumMetaBytes);
                     }
@@ -787,15 +771,6 @@ combine(void* combined_x,
                     // Flush all stores
                     tma_store_wait<0>();
                     __syncwarp();
-                }
-
-                // Issue RDMA
-                // NOTES: for zero-copy mode, we assume the data is already in the send buffer
-                if (dst_p2p_ptr == 0) {
-                    nixlMemViewElem src_mdesc{nixl_ctx.local_mvh, 0, nixl_ctx.offset_get(buf_ptr)};
-                    nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh, (size_t) dst_rank, nixl_ctx.offset_get(dst_ptr)};
-                    EP_DEVICE_ASSERT(nixlPut<nixl_gpu_level_t::WARP>(src_mdesc, dst_mdesc, num_send_bytes,
-                            local_expert_idx, doorbell_flag(token_idx - offset)) == NIXL_IN_PROG);
                 }
             }
         }
@@ -807,13 +782,12 @@ combine(void* combined_x,
             while (ld_acquire_global(atomic_clean_flag) == 0);
             auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx);
             if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
-                void* dst_p2p_ptr = p2p_ptr_get(nixl_ctx, dst_ptr, dst_rank);
-                if (dst_p2p_ptr == 0) {
-                    nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh, (size_t) dst_rank, nixl_ctx.offset_get(dst_ptr)};
-                    EP_DEVICE_ASSERT(nixlAtomicAdd(1, dst_mdesc, local_expert_idx) == NIXL_IN_PROG);
-                } else {
-                    st_release_sys_global(static_cast<uint64_t*>(dst_p2p_ptr), 1);
-                }
+                EP_DEVICE_ASSERT(nixl_ctx.p2p_ptrs != nullptr);
+                void* dst_p2p_base = nixl_ctx.p2p_ptrs[dst_rank];
+                EP_DEVICE_ASSERT(dst_p2p_base != nullptr);
+                void* dst_p2p_ptr = reinterpret_cast<void*>(
+                        reinterpret_cast<uint64_t>(dst_p2p_base) + nixl_ctx.offset_get(dst_ptr));
+                st_release_sys_global(static_cast<uint64_t*>(dst_p2p_ptr), 1);
             }
             atomic_add_release_global(atomic_clean_flag, -1);
         }
