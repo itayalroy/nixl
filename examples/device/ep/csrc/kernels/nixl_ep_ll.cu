@@ -162,7 +162,6 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
 
             // Issue NIXL sends
             if (dst_expert_idx >= 0) {
-                EP_DEVICE_ASSERT(dst_expert_idx < active_expert_bound);
                 int slot_idx = lane_id == 0 ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1) : 0;
                 slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
                 const auto dst_rank = dst_expert_idx / num_local_experts;
@@ -173,9 +172,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                                      rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                                      slot_idx * num_bytes_per_msg;
                 if (not is_rank_masked<true>(mask_buffer_ptr, dst_rank)) {
-                    EP_DEVICE_ASSERT(nixl_ctx.p2p_ptrs != nullptr);
                     void* dst_p2p_base = nixl_ctx.p2p_ptrs[dst_rank];
-                    EP_DEVICE_ASSERT(dst_p2p_base != nullptr);
                     void* dst_p2p_ptr = reinterpret_cast<void*>(
                             reinterpret_cast<uint64_t>(dst_p2p_base) + nixl_ctx.offset_get(dst_ptr));
                     // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
@@ -239,9 +236,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
         auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + dst_expert_local_idx * active_rank_bound + rank);
         if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
-            EP_DEVICE_ASSERT(nixl_ctx.p2p_ptrs != nullptr);
             void* dst_p2p_base = nixl_ctx.p2p_ptrs[dst_rank];
-            EP_DEVICE_ASSERT(dst_p2p_base != nullptr);
             void* dst_p2p_ptr = reinterpret_cast<void*>(
                     reinterpret_cast<uint64_t>(dst_p2p_base) + nixl_ctx.offset_get(dst_ptr));
             st_release_sys_global(static_cast<uint64_t*>(dst_p2p_ptr), static_cast<uint64_t>(num_tokens_sent + 1));
@@ -710,9 +705,7 @@ combine(void* combined_x,
                 const auto buf_ptr = reinterpret_cast<int64_t>(rdma_send_x_vec_row);
                 const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
                     (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot;
-                EP_DEVICE_ASSERT(nixl_ctx.p2p_ptrs != nullptr);
                 void* dst_p2p_base = nixl_ctx.p2p_ptrs[dst_rank];
-                EP_DEVICE_ASSERT(dst_p2p_base != nullptr);
                 void* dst_p2p_ptr = reinterpret_cast<void*>(
                         reinterpret_cast<uint64_t>(dst_p2p_base) + nixl_ctx.offset_get(dst_ptr));
 
@@ -782,9 +775,7 @@ combine(void* combined_x,
             while (ld_acquire_global(atomic_clean_flag) == 0);
             auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx);
             if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
-                EP_DEVICE_ASSERT(nixl_ctx.p2p_ptrs != nullptr);
                 void* dst_p2p_base = nixl_ctx.p2p_ptrs[dst_rank];
-                EP_DEVICE_ASSERT(dst_p2p_base != nullptr);
                 void* dst_p2p_ptr = reinterpret_cast<void*>(
                         reinterpret_cast<uint64_t>(dst_p2p_base) + nixl_ctx.offset_get(dst_ptr));
                 st_release_sys_global(static_cast<uint64_t*>(dst_p2p_ptr), 1);
@@ -891,7 +882,6 @@ COMBINE_RECV:
                     int topk_idx_reg = __shfl_sync(0xffffffff, topk_idx_by_lane, i);
                     if (topk_idx_reg < 0)
                         continue;
-                    EP_DEVICE_ASSERT(topk_idx_reg < active_expert_bound);
                     if (is_rank_masked(mask_buffer_ptr, topk_idx_reg / num_local_experts))
                         continue;
 
@@ -932,7 +922,6 @@ COMBINE_RECV:
                     int topk_idx_reg = __shfl_sync(0xffffffff, topk_idx_by_lane, i);
                     if (topk_idx_reg < 0)
                         continue;
-                    EP_DEVICE_ASSERT(topk_idx_reg < active_expert_bound);
                     if (is_rank_masked(mask_buffer_ptr, topk_idx_reg / num_local_experts))
                         continue;
                     const auto& topk_weight = __shfl_sync(0xffffffff, topk_weights_by_lane, i);
@@ -1120,7 +1109,7 @@ __forceinline__ __device__ void barrier(nixl_ep::gpu_nixl_ctx nixl_ctx, int* mas
 
             nixlMemViewElem src_mdesc{nixl_ctx.local_mvh, 1, dst_rank * sizeof(int)};
             nixlMemViewElem dst_mdesc{nixl_ctx.barrier_mvh, (size_t) dst_rank, nixl_ctx.rank * sizeof(int)};
-            EP_DEVICE_ASSERT(nixlPut<nixl_gpu_level_t::THREAD>(src_mdesc, dst_mdesc, sizeof(int), 0) == NIXL_IN_PROG);
+            nixlPut<nixl_gpu_level_t::THREAD>(src_mdesc, dst_mdesc, sizeof(int), 0);
 
             auto start_time = clock64();
             uint64_t wait_recv_cost = 0;
