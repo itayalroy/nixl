@@ -187,8 +187,12 @@ void Buffer::init(int num_ranks, int num_experts_per_rank, int64_t num_nvl_bytes
     rdma_buffer_ptr = m_rdma_alloc->ptr();
     CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, num_rdma_bytes));
 
-    // Disable the runtime mask for static NVLink benchmarking.
-    mask_buffer_ptr = nullptr;
+    // Allocate and clean shrink buffer
+    int num_mask_buffer_bytes = max_num_ranks * sizeof(int);
+    m_mask_alloc = std::make_unique<vmm_region>(static_cast<size_t>(num_mask_buffer_bytes));
+    mask_buffer_ptr = static_cast<int *>(m_mask_alloc->ptr());
+    CUDA_CHECK(cudaMemset(mask_buffer_ptr, 0xff, num_mask_buffer_bytes));
+    CUDA_CHECK(cudaMemset(mask_buffer_ptr + rank, 0, sizeof(int)));
     active_ranks.assign(max_num_ranks, false);
     active_ranks[rank] = true;
     set_active_rank_bound(rank + 1);
@@ -1263,34 +1267,27 @@ bool is_sm90_compiled() {
 }
 
 void Buffer::update_mask_buffer(int rank_to_mask, bool mask) {
+    EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     EP_HOST_ASSERT(rank_to_mask >= 0 and rank_to_mask < max_num_ranks);
     EP_HOST_ASSERT((rank_to_mask != rank or !mask) && "cannot mask the local rank");
     if (!mask)
         EP_HOST_ASSERT(_is_rank_connected(rank_to_mask) && "cannot unmask an unconnected rank");
     active_ranks[rank_to_mask] = !mask;
     _refresh_active_rank_bound();
-    if (mask_buffer_ptr != nullptr)
-        ep_kernels::update_mask_buffer(mask_buffer_ptr, rank_to_mask, mask, at::cuda::getCurrentCUDAStream());
+    ep_kernels::update_mask_buffer(mask_buffer_ptr, rank_to_mask, mask, at::cuda::getCurrentCUDAStream());
 }
 
 void Buffer::query_mask_buffer(const torch::Tensor& mask_status) {
+    EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     EP_HOST_ASSERT(mask_status.numel() == max_num_ranks && mask_status.scalar_type() == torch::kInt32);
 
-    if (mask_buffer_ptr != nullptr) {
-        ep_kernels::query_mask_buffer(mask_buffer_ptr, max_num_ranks,
-                                      reinterpret_cast<int*>(mask_status.data_ptr()),
-                                      at::cuda::getCurrentCUDAStream());
-        return;
-    }
-
-    std::vector<int> mask(max_num_ranks, 1);
-    for (int rank_id = 0; rank_id < max_num_ranks; ++rank_id)
-        mask[rank_id] = !active_ranks[rank_id];
-    CUDA_CHECK(cudaMemcpy(mask_status.data_ptr(), mask.data(),
-                          max_num_ranks * sizeof(int), cudaMemcpyHostToDevice));
+    ep_kernels::query_mask_buffer(mask_buffer_ptr, max_num_ranks,
+                                  reinterpret_cast<int*>(mask_status.data_ptr()),
+                                  at::cuda::getCurrentCUDAStream());
 }
 
 void Buffer::clean_mask_buffer() {
+    EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
     std::vector<int> mask(max_num_ranks, 1);
     for (int rank_id = 0; rank_id < max_num_ranks; ++rank_id) {
         const bool active = _is_rank_connected(rank_id);
@@ -1298,10 +1295,9 @@ void Buffer::clean_mask_buffer() {
         mask[rank_id] = !active;
     }
     _refresh_active_rank_bound();
-    if (mask_buffer_ptr != nullptr)
-        CUDA_CHECK(cudaMemcpyAsync(mask_buffer_ptr, mask.data(),
-                                   max_num_ranks * sizeof(int), cudaMemcpyHostToDevice,
-                                   at::cuda::getCurrentCUDAStream()));
+    CUDA_CHECK(cudaMemcpyAsync(mask_buffer_ptr, mask.data(),
+                               max_num_ranks * sizeof(int), cudaMemcpyHostToDevice,
+                               at::cuda::getCurrentCUDAStream()));
 }
 
 std::string Buffer::get_local_metadata() const {
