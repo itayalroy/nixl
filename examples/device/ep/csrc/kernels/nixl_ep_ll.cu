@@ -45,11 +45,11 @@ namespace ep_kernels {
 
 template<bool use_warp_sync = false>
 __forceinline__ __device__ bool is_rank_masked(int* mask_buffer_ptr, int rank) {
-    if (mask_buffer_ptr == nullptr) {
-        return false;
-    }
     if constexpr (use_warp_sync) {
-        return __shfl_sync(0xffffffff, ld_acquire_global(mask_buffer_ptr + rank), 0) != 0;
+        int masked = 0;
+        if (get_lane_id() == 0)
+            masked = ld_acquire_global(mask_buffer_ptr + rank);
+        return __shfl_sync(0xffffffff, masked, 0) != 0;
     } else {
         return ld_acquire_global(mask_buffer_ptr + rank) != 0;
     }
@@ -323,8 +323,6 @@ DISPATCH_RECV:
                        rank,
                        local_expert_idx,
                        src_rank);
-                if (mask_buffer_ptr == nullptr)
-                    trap();
                 atomicExch(mask_buffer_ptr + src_rank, 1);
             }
 
@@ -851,8 +849,6 @@ COMBINE_RECV:
                        rank,
                        responsible_expert_idx % num_local_experts,
                        src_rank);
-                if (mask_buffer_ptr == nullptr)
-                    trap();
                 atomicExch(mask_buffer_ptr + src_rank, 1);
             }
 
@@ -918,7 +914,7 @@ COMBINE_RECV:
                     if (topk_idx_reg < 0)
                         continue;
                     EP_DEVICE_ASSERT(topk_idx_reg < active_expert_bound);
-                    if (is_rank_masked(mask_buffer_ptr, topk_idx_reg / num_local_experts))
+                    if (is_rank_masked<true>(mask_buffer_ptr, topk_idx_reg / num_local_experts))
                         continue;
 
                     mbarrier_wait<true>(empty_barriers[stage_idx], tma_phase, stage_idx);
@@ -959,7 +955,7 @@ COMBINE_RECV:
                     if (topk_idx_reg < 0)
                         continue;
                     EP_DEVICE_ASSERT(topk_idx_reg < active_expert_bound);
-                    if (is_rank_masked(mask_buffer_ptr, topk_idx_reg / num_local_experts))
+                    if (is_rank_masked<true>(mask_buffer_ptr, topk_idx_reg / num_local_experts))
                         continue;
                     const auto& topk_weight = __shfl_sync(0xffffffff, topk_weights_by_lane, i);
 
@@ -1156,8 +1152,6 @@ __forceinline__ __device__ void barrier(nixl_ep::gpu_nixl_ctx nixl_ctx, int* mas
             if (wait_recv_cost > timeout_cycles) {
                 printf("Warning: NixlEP timeout for barrier, rank %d, thread %d, dst_rank %d, expected value %d, actual value %d\n",
                        nixl_ctx.rank, thread_id, dst_rank, expected_cnt, ld_acquire_global(nixl_ctx.sync_buffer_ptr + dst_rank));
-                if (mask_buffer_ptr == nullptr)
-                    trap();
                 atomicExch(mask_buffer_ptr + dst_rank, 1);
             }
         }
