@@ -866,14 +866,18 @@ COMBINE_RECV:
     EP_DEVICE_ASSERT(num_topk <= 32);
     EP_DEVICE_ASSERT(num_groups > 0);
 
-    if (group_idx < num_groups) {
-        constexpr int kNumStages = 3;
-        constexpr int kNumTMABufferBytes = 16 * 2 + kHidden * 2;
-        constexpr int kNumBF16PerWarpBytes = 32 * kNumRecvUnrolls * kNumElemsPerInt4 * 2;
-        constexpr int kNumLogFMTPerWarpBytes = kNumBF16PerWarpBytes / 16 * 10;
-        constexpr int kNumDivisionBytes = kNumDivisions * sizeof(uint32_t);
-        constexpr int kNumBytesPerGroup = kNumStages * kNumTMABufferBytes + kHidden * 2 + kNumStages * kNumDivisionBytes * 3;
+    constexpr int kNumStages = 3;
+    constexpr int kNumTMABufferBytes = 16 * 2 + kHidden * 2;
+    constexpr int kNumBF16PerWarpBytes = 32 * kNumRecvUnrolls * kNumElemsPerInt4 * 2;
+    constexpr int kNumLogFMTPerWarpBytes = kNumBF16PerWarpBytes / 16 * 10;
+    constexpr int kNumDivisionBytes = kNumDivisions * sizeof(uint32_t);
+    constexpr int kNumBytesPerGroup = kNumStages * kNumTMABufferBytes + kHidden * 2 + kNumStages * kNumDivisionBytes * 3;
+    auto rank_mask_cache = reinterpret_cast<int*>(smem_buffer + kMaxNumGroups * kNumBytesPerGroup);
+    for (int rank_idx = thread_id; rank_idx < active_rank_bound; rank_idx += num_threads)
+        rank_mask_cache[rank_idx] = -1;
+    __syncthreads();
 
+    if (group_idx < num_groups) {
         // Reallocate shared memory
         const auto smem_group_buffer = smem_buffer + kNumBytesPerGroup * group_idx;
         auto full_barriers  = PatternVisitor([=](const int& i) { return reinterpret_cast<uint64_t*>(smem_group_buffer + i * kNumTMABufferBytes); });
@@ -911,7 +915,13 @@ COMBINE_RECV:
                     if (topk_idx_reg < 0)
                         continue;
                     EP_DEVICE_ASSERT(topk_idx_reg < active_expert_bound);
-                    if (mask_buffer_ptr[topk_idx_reg / num_local_experts] != 0)
+                    const int topk_rank = topk_idx_reg / num_local_experts;
+                    int cached_rank_mask = rank_mask_cache[topk_rank];
+                    if (cached_rank_mask < 0) {
+                        cached_rank_mask = mask_buffer_ptr[topk_rank];
+                        rank_mask_cache[topk_rank] = cached_rank_mask;
+                    }
+                    if (cached_rank_mask != 0)
                         continue;
 
                     mbarrier_wait<true>(empty_barriers[stage_idx], tma_phase, stage_idx);
@@ -952,7 +962,13 @@ COMBINE_RECV:
                     if (topk_idx_reg < 0)
                         continue;
                     EP_DEVICE_ASSERT(topk_idx_reg < active_expert_bound);
-                    if (mask_buffer_ptr[topk_idx_reg / num_local_experts] != 0)
+                    const int topk_rank = topk_idx_reg / num_local_experts;
+                    int cached_rank_mask = rank_mask_cache[topk_rank];
+                    if (cached_rank_mask < 0) {
+                        cached_rank_mask = mask_buffer_ptr[topk_rank];
+                        rank_mask_cache[topk_rank] = cached_rank_mask;
+                    }
+                    if (cached_rank_mask != 0)
                         continue;
                     const auto& topk_weight = __shfl_sync(0xffffffff, topk_weights_by_lane, i);
 
@@ -1039,8 +1055,10 @@ void combine(void* combined_x,
     const int smem_send_size = num_warps * (kNumStages * num_send_tma_bytes + num_meta_bytes);
 
     // Receive buffer size
-    const int num_recv_tma_bytes = 16 + hidden * 2;
-    const int smem_recv_size = kMaxNumGroups * (kNumStages * num_recv_tma_bytes + hidden * 2 + kNumStages * num_meta_bytes * 3);
+    const int num_recv_tma_bytes = 32 + hidden * 2;
+    const int smem_recv_size =
+        kMaxNumGroups * (kNumStages * num_recv_tma_bytes + hidden * 2 + kNumStages * num_meta_bytes * 3) +
+        active_rank_bound * sizeof(int);
 
     // Total requirement
     const int smem_size = max(smem_send_size, smem_recv_size);
