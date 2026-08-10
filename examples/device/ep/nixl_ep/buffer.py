@@ -356,8 +356,8 @@ class Buffer:
             num_max_dispatch_tokens_per_rank: the maximum number of tokens to dispatch, all the ranks must hold the same value.
                 `num_ranks * num_max_dispatch_tokens_per_rank` must be a multiple of 4 for TMA alignment.
             num_experts: deprecated optional parameter. This value is ignored by low-latency
-                dispatch; the number of experts is determined from the `num_experts_per_rank`
-                passed to `update_memory_buffers()` and the currently active ranks.
+                dispatch; the number of experts is determined from the rank capacity and
+                `num_experts_per_rank` passed to `update_memory_buffers()`.
             cumulative_local_expert_recv_stats: a cumulative expert count tensor for statistics, which should have shape
                 `[num_local_experts]` and be typed as `torch.int`. This is useful for online service EP load balance
                 monitoring.
@@ -375,15 +375,15 @@ class Buffer:
         Returns:
             recv_x: a tensor or tuple with received tokens for each expert.
                 With `use_fp8=True`: the first element is a `torch.Tensor` shaped as
-                `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden]` with `torch.float8_e4m3fn`.
+                `[num_local_experts, num_max_dispatch_tokens_per_rank * rank_capacity, hidden]` with `torch.float8_e4m3fn`.
                 The second tensor is the corresponding scales for the first element with shape
-                `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden // 128]` with `torch.float`,
+                `[num_local_experts, num_max_dispatch_tokens_per_rank * rank_capacity, hidden // 128]` with `torch.float`,
                 if `use_ue8m0=False`. With `use_ue8m0=True`, the second one is packed and shaped as
-                `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden // 512]` with type `torch.int`.
+                `[num_local_experts, num_max_dispatch_tokens_per_rank * rank_capacity, hidden // 512]` with type `torch.int`.
                 Notice that, the last-two-dimension of the scaling tensors are in column-major for TMA compatibility.
                 With `use_fp8=False`, the result would be a tensor shaped as
-                `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden]` with `torch.bfloat16`.
-                Moreover, not all tokens are valid, only some of the `num_max_dispatch_tokens_per_rank * num_ranks` are,
+                `[num_local_experts, num_max_dispatch_tokens_per_rank * rank_capacity, hidden]` with `torch.bfloat16`.
+                Moreover, not all tokens are valid, only some of the capacity-sized token slots are,
                 as we do not synchronize CPU received count with GPU (also not incompatible with CUDA graph if synced).
             recv_count: a tensor shaped `[num_local_experts]` with type `torch.int`, indicating how many tokens each
                 expert receives. As mentioned before, not all tokens are valid in `recv_x`.
@@ -459,7 +459,7 @@ class Buffer:
             kernels' result tensors at a single moment.
 
         Arguments:
-            x: `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden]` with `torch.bfloat16`,
+            x: `[num_local_experts, num_max_dispatch_tokens_per_rank * rank_capacity, hidden]` with `torch.bfloat16`,
                 the local calculated tokens to be sent to this original rank and reduced.
             topk_idx: `[num_combined_tokens, num_topk]` with `nixl_ep.topk_idx_t`, the expert indices selected by the dispatched
                 tokens. `-1` indices (not selecting any expert) are supported. Note that, `num_combined_tokens` equals

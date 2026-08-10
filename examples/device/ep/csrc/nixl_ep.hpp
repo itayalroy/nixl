@@ -112,12 +112,8 @@ private:
     int rank, rdma_rank, nvl_rank;
     int max_num_ranks;
     std::vector<int> remote_ranks; /* global ranks */
-    // Host-side active rank state over max_num_ranks. This can differ from
-    // the runtime device mask, which kernels may update on faults/timeouts.
-    // Host state changes only through explicit control APIs.
-    std::vector<bool> active_ranks;
-    // Upper bound for active rank ids. Ranks may be sparse;
-    // masked holes inside [0, active_rank_bound) are skipped by LL kernels.
+    // Fixed rank capacity. Masked ranks inside this range are skipped by LL
+    // kernels without changing graph-visible tensor shapes or launch bounds.
     int active_rank_bound = 0;
     int num_rdma_ranks = 0, num_nvl_ranks = 0;
     int num_experts_per_rank = 0;
@@ -173,9 +169,6 @@ private:
     void _nixl_ep_memory_views_destroy(void);
     void _nixl_ep_destroy(void);
     bool _is_rank_connected(int rank_id) const;
-    void set_active_rank_bound(int bound);
-    void _refresh_active_rank_bound();
-
     /* high-throughput mode private funcs */
     void _ipc_handles_sync(const std::vector<std::optional<pybind11::bytearray>> &all_gathered_handles);
 

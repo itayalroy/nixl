@@ -91,22 +91,6 @@ bool Buffer::_is_rank_connected(int rank_id) const {
     return rank_id == rank or std::find(remote_ranks.begin(), remote_ranks.end(), rank_id) != remote_ranks.end();
 }
 
-void Buffer::set_active_rank_bound(int bound) {
-    EP_HOST_ASSERT(bound > 0 && "active_rank_bound must be positive");
-    active_rank_bound = bound;
-}
-
-void Buffer::_refresh_active_rank_bound() {
-    int bound = 0;
-    for (int rank_id = max_num_ranks - 1; rank_id >= 0; --rank_id) {
-        if (active_ranks[rank_id]) {
-            bound = rank_id + 1;
-            break;
-        }
-    }
-    set_active_rank_bound(bound);
-}
-
 void Buffer::init(int num_ranks, int num_experts_per_rank, int64_t num_nvl_bytes, int64_t num_rdma_bytes)
 {
     EP_HOST_ASSERT(num_ranks > 0);
@@ -193,9 +177,7 @@ void Buffer::init(int num_ranks, int num_experts_per_rank, int64_t num_nvl_bytes
     mask_buffer_ptr = static_cast<int *>(m_mask_alloc->ptr());
     CUDA_CHECK(cudaMemset(mask_buffer_ptr, 0xff, num_mask_buffer_bytes));
     CUDA_CHECK(cudaMemset(mask_buffer_ptr + rank, 0, sizeof(int)));
-    active_ranks.assign(max_num_ranks, false);
-    active_ranks[rank] = true;
-    set_active_rank_bound(rank + 1);
+    active_rank_bound = max_num_ranks;
 
     int num_sync_buffer_bytes = max_num_ranks * sizeof(int);
     m_sync_alloc = std::make_unique<vmm_region>(static_cast<size_t>(num_sync_buffer_bytes));
@@ -1276,8 +1258,6 @@ void Buffer::update_mask_buffer(int rank_to_mask, bool mask) {
     EP_HOST_ASSERT((rank_to_mask != rank or !mask) && "cannot mask the local rank");
     if (!mask)
         EP_HOST_ASSERT(_is_rank_connected(rank_to_mask) && "cannot unmask an unconnected rank");
-    active_ranks[rank_to_mask] = !mask;
-    _refresh_active_rank_bound();
     ep_kernels::update_mask_buffer(mask_buffer_ptr, rank_to_mask, mask, at::cuda::getCurrentCUDAStream());
 }
 
@@ -1298,10 +1278,8 @@ void Buffer::clean_mask_buffer() {
     std::vector<int> mask(max_num_ranks, 1);
     for (int rank_id = 0; rank_id < max_num_ranks; ++rank_id) {
         const bool active = _is_rank_connected(rank_id);
-        active_ranks[rank_id] = active;
         mask[rank_id] = !active;
     }
-    _refresh_active_rank_bound();
     CUDA_CHECK(cudaMemcpyAsync(mask_buffer_ptr, mask.data(),
                                max_num_ranks * sizeof(int), cudaMemcpyHostToDevice,
                                at::cuda::getCurrentCUDAStream()));
