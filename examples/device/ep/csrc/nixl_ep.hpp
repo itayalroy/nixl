@@ -259,6 +259,8 @@ public:
     void clean_mask_buffer();
 
     std::string get_local_metadata() const;
+
+    std::vector<uint64_t> get_debug_state() const;
 };
 
 } // namespace nixl_ep

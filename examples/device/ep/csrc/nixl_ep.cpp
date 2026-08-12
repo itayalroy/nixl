@@ -1300,6 +1300,29 @@ std::string Buffer::get_local_metadata() const {
     return metadata_blob;
 }
 
+std::vector<uint64_t> Buffer::get_debug_state() const {
+    gpu_nixl_ctx ctx;
+    CUDA_CHECK(cudaMemcpy(&ctx, gpu_ctx_ptr, sizeof(ctx), cudaMemcpyDeviceToHost));
+    std::vector<void*> p2p_ptrs(max_num_ranks);
+    CUDA_CHECK(cudaMemcpy(p2p_ptrs.data(), ctx.p2p_ptrs,
+                          max_num_ranks * sizeof(void*), cudaMemcpyDeviceToHost));
+    std::vector<uint64_t> state = {
+        reinterpret_cast<uint64_t>(gpu_ctx_ptr),
+        reinterpret_cast<uint64_t>(ctx.local_mvh),
+        reinterpret_cast<uint64_t>(ctx.barrier_mvh),
+        reinterpret_cast<uint64_t>(ctx.remote_mvh),
+        reinterpret_cast<uint64_t>(ctx.ht_barrier_mvh),
+        reinterpret_cast<uint64_t>(ctx.rdma_buffer_ptr),
+        reinterpret_cast<uint64_t>(ctx.p2p_ptrs),
+        static_cast<uint64_t>(ctx.max_num_ranks),
+        static_cast<uint64_t>(ctx.num_rdma_ranks),
+        static_cast<uint64_t>(ctx.rank),
+    };
+    for (void* ptr : p2p_ptrs)
+        state.push_back(reinterpret_cast<uint64_t>(ptr));
+    return state;
+}
+
 void Buffer::_nixl_ep_memory_views_create(void) {
     if (low_latency_mode) {
         if (!gpu_ctx.local_mvh) {
@@ -1598,7 +1621,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_next_combine_buffer", &nixl_ep::Buffer::get_next_combine_buffer)
         .def("get_local_metadata", [](const nixl_ep::Buffer &buffer) -> pybind11::bytes {
             return pybind11::bytes(buffer.get_local_metadata());
-        });
+        })
+        .def("get_debug_state", &nixl_ep::Buffer::get_debug_state);
     m.attr("topk_idx_t") = pybind11::cast(c10::CppTypeToScalarType<nixl_ep::topk_idx_t>::value);
     m.def("is_sm90_compiled", nixl_ep::is_sm90_compiled);
 }
