@@ -1317,6 +1317,7 @@ std::vector<uint64_t> Buffer::get_debug_state() const {
         static_cast<uint64_t>(ctx.max_num_ranks),
         static_cast<uint64_t>(ctx.num_rdma_ranks),
         static_cast<uint64_t>(ctx.rank),
+        static_cast<uint64_t>(buffer_idx),
     };
     for (void* ptr : p2p_ptrs)
         state.push_back(reinterpret_cast<uint64_t>(ptr));
