@@ -486,7 +486,7 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 
         _nixl_ep_memory_views_create();
 
-        for (int remote_rank : new_ranks)
+        for (int remote_rank : remote_ranks)
             ep_kernels::cache_p2p_ptr(gpu_ctx_ptr, remote_rank, comm_stream);
 
         CUDA_CHECK(cudaDeviceSynchronize());
