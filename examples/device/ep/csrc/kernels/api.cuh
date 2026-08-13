@@ -41,6 +41,8 @@ struct gpu_nixl_ctx {
     nixlMemViewH barrier_mvh;
     nixlMemViewH remote_mvh;
     nixlMemViewH ht_barrier_mvh;
+    nixlMemViewH *peer_barrier_mvhs;
+    nixlMemViewH *peer_remote_mvhs;
     int *sync_buffer_ptr; // [src_rank]
     int *sync_count_ptr; // [dst_rank]
     uint64_t *last_ht_barrier_counter;
@@ -53,6 +55,18 @@ struct gpu_nixl_ctx {
 
     __device__ inline uint64_t offset_get(uint64_t ptr) {
         return ptr - reinterpret_cast<uint64_t>(rdma_buffer_ptr);
+    }
+
+    __device__ inline nixlMemViewH remote_mvh_get(int peer_rank) {
+        return peer_remote_mvhs ? peer_remote_mvhs[peer_rank] : remote_mvh;
+    }
+
+    __device__ inline nixlMemViewH barrier_mvh_get(int peer_rank) {
+        return peer_barrier_mvhs ? peer_barrier_mvhs[peer_rank] : barrier_mvh;
+    }
+
+    __device__ inline size_t remote_mvh_index(int peer_rank) {
+        return peer_remote_mvhs ? 0 : peer_rank;
     }
 };
 

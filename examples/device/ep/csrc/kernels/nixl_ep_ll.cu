@@ -198,7 +198,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     void* dst_p2p_ptr = p2p_ptr_get(nixl_ctx, dst_ptr, dst_rank);
                     if (dst_p2p_ptr == 0) {
                         nixlMemViewElem src_mdesc{nixl_ctx.local_mvh, 0, nixl_ctx.offset_get(src_ptr)};
-                        nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh, (size_t) dst_rank, nixl_ctx.offset_get(dst_ptr)};
+                        nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh_get(dst_rank),
+                                                 nixl_ctx.remote_mvh_index(dst_rank), nixl_ctx.offset_get(dst_ptr)};
                         EP_DEVICE_ASSERT(nixlPut<nixl_gpu_level_t::WARP>(src_mdesc, dst_mdesc, num_bytes_per_msg,
                                 dst_expert_local_idx, doorbell_flag(slot_idx)) == NIXL_IN_PROG);
                     } else {
@@ -266,7 +267,8 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
             void* dst_p2p_ptr = p2p_ptr_get(nixl_ctx, dst_ptr, dst_rank);
             if (dst_p2p_ptr == 0) {
-                nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh, static_cast<size_t>(dst_rank), nixl_ctx.offset_get(dst_ptr)};
+                nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh_get(dst_rank),
+                                         nixl_ctx.remote_mvh_index(dst_rank), nixl_ctx.offset_get(dst_ptr)};
                 EP_DEVICE_ASSERT(nixlAtomicAdd(num_tokens_sent + 1, dst_mdesc, dst_expert_local_idx) == NIXL_IN_PROG);
             } else {
                 st_release_sys_global(static_cast<uint64_t*>(dst_p2p_ptr), static_cast<uint64_t>(num_tokens_sent + 1));
@@ -802,7 +804,8 @@ combine(void* combined_x,
                 // NOTES: for zero-copy mode, we assume the data is already in the send buffer
                 if (dst_p2p_ptr == 0) {
                     nixlMemViewElem src_mdesc{nixl_ctx.local_mvh, 0, nixl_ctx.offset_get(buf_ptr)};
-                    nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh, (size_t) dst_rank, nixl_ctx.offset_get(dst_ptr)};
+                    nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh_get(dst_rank),
+                                             nixl_ctx.remote_mvh_index(dst_rank), nixl_ctx.offset_get(dst_ptr)};
                     EP_DEVICE_ASSERT(nixlPut<nixl_gpu_level_t::WARP>(src_mdesc, dst_mdesc, num_send_bytes,
                             local_expert_idx, doorbell_flag(token_idx - offset)) == NIXL_IN_PROG);
                 }
@@ -818,7 +821,8 @@ combine(void* combined_x,
             if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
                 void* dst_p2p_ptr = p2p_ptr_get(nixl_ctx, dst_ptr, dst_rank);
                 if (dst_p2p_ptr == 0) {
-                    nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh, (size_t) dst_rank, nixl_ctx.offset_get(dst_ptr)};
+                    nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh_get(dst_rank),
+                                             nixl_ctx.remote_mvh_index(dst_rank), nixl_ctx.offset_get(dst_ptr)};
                     EP_DEVICE_ASSERT(nixlAtomicAdd(1, dst_mdesc, local_expert_idx) == NIXL_IN_PROG);
                 } else {
                     st_release_sys_global(static_cast<uint64_t*>(dst_p2p_ptr), 1);
@@ -1131,8 +1135,9 @@ void update_mask_buffer(int* mask_buffer_ptr, int rank, bool mask, cudaStream_t 
 __global__ void cache_p2p_ptr_kernel(nixl_ep::gpu_nixl_ctx* nixl_ctx_ptr,
                                      int rank_id) {
     auto nixl_ctx = *nixl_ctx_ptr;
+    auto remote_mvh = nixl_ctx.remote_mvh_get(rank_id);
     nixl_ctx.p2p_ptrs[rank_id] =
-        nixl_ctx.remote_mvh == nullptr ? nullptr : nixlGetPtr(nixl_ctx.remote_mvh, rank_id);
+        remote_mvh == nullptr ? nullptr : nixlGetPtr(remote_mvh, nixl_ctx.remote_mvh_index(rank_id));
 }
 
 void cache_p2p_ptr(gpu_nixl_ctx* nixl_ctx, int rank_id, cudaStream_t stream) {
@@ -1153,7 +1158,8 @@ __forceinline__ __device__ void barrier(nixl_ep::gpu_nixl_ctx nixl_ctx, int* mas
             int expected_cnt = atomicAdd(nixl_ctx.sync_count_ptr + dst_rank, -1) - 1;
 
             nixlMemViewElem src_mdesc{nixl_ctx.local_mvh, 1, dst_rank * sizeof(int)};
-            nixlMemViewElem dst_mdesc{nixl_ctx.barrier_mvh, (size_t) dst_rank, nixl_ctx.rank * sizeof(int)};
+            nixlMemViewElem dst_mdesc{nixl_ctx.barrier_mvh_get(dst_rank),
+                                     nixl_ctx.remote_mvh_index(dst_rank), nixl_ctx.rank * sizeof(int)};
             EP_DEVICE_ASSERT(nixlPut<nixl_gpu_level_t::THREAD>(src_mdesc, dst_mdesc, sizeof(int), 0) == NIXL_IN_PROG);
 
             auto start_time = clock64();

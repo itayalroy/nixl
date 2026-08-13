@@ -154,6 +154,8 @@ private:
     NixlPeerInfo my_peer_info;
     nixl_ep::gpu_nixl_ctx gpu_ctx;
     nixl_ep::gpu_nixl_ctx* gpu_ctx_ptr = nullptr;
+    std::vector<nixlMemViewH> peer_barrier_mvhs;
+    std::vector<nixlMemViewH> peer_remote_mvhs;
     uint64_t* last_ht_barrier_counter = nullptr;
     uint64_t* local_ht_barrier_counter = nullptr;
 
@@ -166,7 +168,7 @@ private:
 
     void _nixl_ep_init(void);
     void _nixl_ep_memory_views_create(void);
-    void _nixl_ep_memory_views_destroy(void);
+    void _nixl_ep_memory_views_destroy(const std::vector<int>& ranks = {});
     void _nixl_ep_destroy(void);
     bool _is_rank_connected(int rank_id) const;
     /* high-throughput mode private funcs */

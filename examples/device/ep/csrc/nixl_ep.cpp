@@ -482,11 +482,12 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 
         _nixl_agents_peer_info_gather(new_ranks);
 
-        _nixl_ep_memory_views_destroy();
+        if (!low_latency_mode)
+            _nixl_ep_memory_views_destroy();
 
         _nixl_ep_memory_views_create();
 
-        for (int remote_rank : remote_ranks)
+        for (int remote_rank : new_ranks)
             ep_kernels::cache_p2p_ptr(gpu_ctx_ptr, remote_rank, comm_stream);
 
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -517,7 +518,10 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
         CUDA_CHECK(cudaMemset(gpu_ctx.p2p_ptrs + removed_rank, 0, sizeof(void*)));
     }
 
-    _nixl_ep_memory_views_destroy();
+    if (low_latency_mode)
+        _nixl_ep_memory_views_destroy(remote_ranks_list);
+    else
+        _nixl_ep_memory_views_destroy();
 
     _nixl_agents_peer_info_cleanup(remote_ranks_list);
 
@@ -531,7 +535,8 @@ void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
         );
     }
 
-    _nixl_ep_memory_views_create();
+    if (!low_latency_mode)
+        _nixl_ep_memory_views_create();
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
@@ -1296,6 +1301,44 @@ std::string Buffer::get_local_metadata() const {
 }
 
 void Buffer::_nixl_ep_memory_views_create(void) {
+    if (low_latency_mode) {
+        if (!gpu_ctx.local_mvh) {
+            nixl_local_dlist_t local_descs(VRAM_SEG);
+            local_descs.addDesc(nixlBlobDesc((uintptr_t)(rdma_buffer_ptr), num_rdma_bytes,
+                                             get_local_device_id(), ""));
+            local_descs.addDesc(nixlBlobDesc((uintptr_t)(sync_count_ptr), max_num_ranks * sizeof(int),
+                                             get_local_device_id(), ""));
+            EP_HOST_ASSERT(nixl_agent_info->agent->prepMemView(
+                               local_descs, gpu_ctx.local_mvh,
+                               &nixl_agent_info->extra_params) == NIXL_SUCCESS);
+        }
+
+        for (int remote_rank : remote_ranks) {
+            if (peer_remote_mvhs[remote_rank])
+                continue;
+            const auto &peer = nixl_peer_info[remote_rank];
+            const auto &agent = nixl_agent_info->remote_agent_names[remote_rank];
+            nixl_remote_dlist_t remote_desc(VRAM_SEG);
+            nixl_remote_dlist_t barrier_desc(VRAM_SEG);
+            remote_desc.addDesc(nixlRemoteDesc((uintptr_t)peer.rdma_buffer_ptr,
+                                               num_rdma_bytes, peer.device_id, agent));
+            barrier_desc.addDesc(nixlRemoteDesc((uintptr_t)peer.sync_buffer_ptr,
+                                                max_num_ranks * sizeof(int), peer.device_id, agent));
+            EP_HOST_ASSERT(nixl_agent_info->agent->prepMemView(
+                               remote_desc, peer_remote_mvhs[remote_rank],
+                               &nixl_agent_info->extra_params) == NIXL_SUCCESS);
+            EP_HOST_ASSERT(nixl_agent_info->agent->prepMemView(
+                               barrier_desc, peer_barrier_mvhs[remote_rank],
+                               &nixl_agent_info->extra_params) == NIXL_SUCCESS);
+        }
+        CUDA_CHECK(cudaMemcpy(gpu_ctx.peer_remote_mvhs, peer_remote_mvhs.data(),
+                              max_num_ranks * sizeof(nixlMemViewH), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpu_ctx.peer_barrier_mvhs, peer_barrier_mvhs.data(),
+                              max_num_ranks * sizeof(nixlMemViewH), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(gpu_ctx_ptr, &gpu_ctx, sizeof(gpu_ctx), cudaMemcpyHostToDevice));
+        return;
+    }
+
     nixl_remote_dlist_t remote_descs(VRAM_SEG);
     nixl_remote_dlist_t barrier_descs(VRAM_SEG);
     nixl_local_dlist_t local_descs(VRAM_SEG);
@@ -1327,7 +1370,26 @@ void Buffer::_nixl_ep_memory_views_create(void) {
     CUDA_CHECK(cudaMemcpy(gpu_ctx_ptr, &gpu_ctx, sizeof(gpu_ctx), cudaMemcpyHostToDevice));
 }
 
-void Buffer::_nixl_ep_memory_views_destroy(void) {
+void Buffer::_nixl_ep_memory_views_destroy(const std::vector<int>& ranks) {
+    if (low_latency_mode) {
+        const auto &removed_ranks = ranks.empty() ? remote_ranks : ranks;
+        for (int remote_rank : removed_ranks) {
+            if (peer_remote_mvhs[remote_rank])
+                nixl_agent_info->agent->releaseMemView(peer_remote_mvhs[remote_rank]);
+            if (peer_barrier_mvhs[remote_rank])
+                nixl_agent_info->agent->releaseMemView(peer_barrier_mvhs[remote_rank]);
+            peer_remote_mvhs[remote_rank] = nullptr;
+            peer_barrier_mvhs[remote_rank] = nullptr;
+        }
+        if (gpu_ctx.peer_remote_mvhs) {
+            CUDA_CHECK(cudaMemcpy(gpu_ctx.peer_remote_mvhs, peer_remote_mvhs.data(),
+                                  max_num_ranks * sizeof(nixlMemViewH), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(gpu_ctx.peer_barrier_mvhs, peer_barrier_mvhs.data(),
+                                  max_num_ranks * sizeof(nixlMemViewH), cudaMemcpyHostToDevice));
+        }
+        if (!ranks.empty())
+            return;
+    }
     if (gpu_ctx.local_mvh) nixl_agent_info->agent->releaseMemView(gpu_ctx.local_mvh);
     if (gpu_ctx.remote_mvh) nixl_agent_info->agent->releaseMemView(gpu_ctx.remote_mvh);
     if (gpu_ctx.barrier_mvh) nixl_agent_info->agent->releaseMemView(gpu_ctx.barrier_mvh);
@@ -1350,6 +1412,18 @@ void Buffer::_nixl_ep_init(void) {
         .num_rdma_ranks = num_rdma_ranks,
         .rank = rank,
     };
+    if (low_latency_mode) {
+        peer_remote_mvhs.resize(max_num_ranks);
+        peer_barrier_mvhs.resize(max_num_ranks);
+        CUDA_CHECK(cudaMalloc(&gpu_ctx.peer_remote_mvhs,
+                              max_num_ranks * sizeof(nixlMemViewH)));
+        CUDA_CHECK(cudaMalloc(&gpu_ctx.peer_barrier_mvhs,
+                              max_num_ranks * sizeof(nixlMemViewH)));
+        CUDA_CHECK(cudaMemset(gpu_ctx.peer_remote_mvhs, 0,
+                              max_num_ranks * sizeof(nixlMemViewH)));
+        CUDA_CHECK(cudaMemset(gpu_ctx.peer_barrier_mvhs, 0,
+                              max_num_ranks * sizeof(nixlMemViewH)));
+    }
     CUDA_CHECK(cudaMalloc(&gpu_ctx.p2p_ptrs, max_num_ranks * sizeof(void*)));
     CUDA_CHECK(cudaMemset(gpu_ctx.p2p_ptrs, 0, max_num_ranks * sizeof(void*)));
     CUDA_CHECK(cudaMalloc(&gpu_ctx_ptr, sizeof(gpu_nixl_ctx)));
@@ -1358,6 +1432,14 @@ void Buffer::_nixl_ep_init(void) {
 
 void Buffer::_nixl_ep_destroy(void) {
     _nixl_ep_memory_views_destroy();
+    if (gpu_ctx.peer_remote_mvhs != nullptr) {
+        cudaFree(gpu_ctx.peer_remote_mvhs);
+        gpu_ctx.peer_remote_mvhs = nullptr;
+    }
+    if (gpu_ctx.peer_barrier_mvhs != nullptr) {
+        cudaFree(gpu_ctx.peer_barrier_mvhs);
+        gpu_ctx.peer_barrier_mvhs = nullptr;
+    }
     if (gpu_ctx.p2p_ptrs != nullptr) {
         cudaFree(gpu_ctx.p2p_ptrs);
         gpu_ctx.p2p_ptrs = nullptr;
