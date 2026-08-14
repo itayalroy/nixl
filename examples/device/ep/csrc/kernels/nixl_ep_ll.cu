@@ -1161,8 +1161,10 @@ __global__ void probe_peer_counters_kernel(
     auto nixl_ctx = *nixl_ctx_ptr;
     auto remote_base = static_cast<uint8_t*>(nixl_ctx.p2p_ptrs[rank_id]);
     EP_DEVICE_ASSERT(remote_base != nullptr);
-    atomicAdd_system(reinterpret_cast<unsigned long long*>(remote_base + offset_0), 0);
-    atomicAdd_system(reinterpret_cast<unsigned long long*>(remote_base + offset_1), 0);
+    st_release_sys_global(
+        reinterpret_cast<uint64_t*>(remote_base + offset_0 + 128), 0);
+    st_release_sys_global(
+        reinterpret_cast<uint64_t*>(remote_base + offset_1 + 128), 0);
 }
 
 void probe_peer_counters(gpu_nixl_ctx* nixl_ctx, int rank_id,
