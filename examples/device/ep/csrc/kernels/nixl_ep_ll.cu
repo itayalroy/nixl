@@ -265,6 +265,18 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + dst_expert_local_idx * active_rank_bound + rank);
         if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
             void* dst_p2p_ptr = p2p_ptr_get(nixl_ctx, dst_ptr, dst_rank);
+            if (rank == 0 and responsible_expert_idx == 36 and
+                nixl_ctx.p2p_ptrs[2] != nullptr) {
+                printf("NIXL_EP_DISPATCH_PTR rank=%d expert=%d dst_rank=%d "
+                       "local_expert=%d recv_count=%p local_rdma=%p "
+                       "remote_base=%p offset=%llu dst=%p\n",
+                       rank, responsible_expert_idx, dst_rank,
+                       dst_expert_local_idx, rdma_recv_count,
+                       nixl_ctx.rdma_buffer_ptr, nixl_ctx.p2p_ptrs[dst_rank],
+                       static_cast<unsigned long long>(
+                           nixl_ctx.offset_get(dst_ptr)),
+                       dst_p2p_ptr);
+            }
             if (dst_p2p_ptr == 0) {
                 nixlMemViewElem dst_mdesc{nixl_ctx.remote_mvh, static_cast<size_t>(dst_rank), nixl_ctx.offset_get(dst_ptr)};
                 EP_DEVICE_ASSERT(nixlAtomicAdd(num_tokens_sent + 1, dst_mdesc, dst_expert_local_idx) == NIXL_IN_PROG);
