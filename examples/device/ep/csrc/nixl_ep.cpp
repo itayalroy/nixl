@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <cuda_runtime.h>
 #include <memory>
@@ -482,6 +483,44 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 
         _nixl_agents_peer_info_gather(new_ranks);
 
+        auto dump_p2p_ptrs = [this](const char* phase) {
+            if (std::getenv("NIXL_EP_DEBUG_P2P_PTRS") == nullptr)
+                return;
+
+            std::vector<void*> p2p_ptrs(max_num_ranks);
+            CUDA_CHECK(cudaMemcpy(p2p_ptrs.data(), gpu_ctx.p2p_ptrs,
+                                  p2p_ptrs.size() * sizeof(void*),
+                                  cudaMemcpyDeviceToHost));
+            std::fprintf(stderr,
+                         "NIXL_EP_P2P rank=%d phase=%s ctx=%p table=%p "
+                         "local_rdma=%p remote_mvh=%p bytes=%ld\n",
+                         rank, phase, static_cast<void*>(gpu_ctx_ptr),
+                         static_cast<void*>(gpu_ctx.p2p_ptrs), rdma_buffer_ptr,
+                         static_cast<void*>(gpu_ctx.remote_mvh), num_rdma_bytes);
+            for (int remote_rank : remote_ranks) {
+                cudaPointerAttributes attrs{};
+                auto status = cudaPointerGetAttributes(
+                    &attrs, p2p_ptrs[remote_rank]);
+                std::fprintf(
+                    stderr,
+                    "NIXL_EP_P2P rank=%d phase=%s peer=%d mapped=%p "
+                    "remote_rdma=%p remote_device=%d attr_status=%s "
+                    "attr_type=%d attr_device=%d attr_device_ptr=%p\n",
+                    rank, phase, remote_rank, p2p_ptrs[remote_rank],
+                    nixl_peer_info[remote_rank].rdma_buffer_ptr,
+                    nixl_peer_info[remote_rank].device_id,
+                    cudaGetErrorName(status),
+                    status == cudaSuccess ? attrs.type : -1,
+                    status == cudaSuccess ? attrs.device : -1,
+                    status == cudaSuccess ? attrs.devicePointer : nullptr);
+                if (status != cudaSuccess)
+                    cudaGetLastError();
+            }
+            std::fflush(stderr);
+        };
+
+        dump_p2p_ptrs("before_recreate");
+
         _nixl_ep_memory_views_destroy();
 
         _nixl_ep_memory_views_create();
@@ -490,6 +529,7 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
             ep_kernels::cache_p2p_ptr(gpu_ctx_ptr, remote_rank, comm_stream);
 
         CUDA_CHECK(cudaDeviceSynchronize());
+        dump_p2p_ptrs("after_recreate");
     }
 
     if (activate) {
