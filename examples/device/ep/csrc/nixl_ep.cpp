@@ -482,8 +482,6 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 
         _nixl_agents_peer_info_gather(new_ranks);
 
-        _nixl_ep_memory_views_destroy();
-
         _nixl_ep_memory_views_create();
 
         for (int remote_rank : new_ranks)
