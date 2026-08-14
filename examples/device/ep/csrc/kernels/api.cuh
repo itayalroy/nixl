@@ -249,6 +249,10 @@ void update_mask_buffer(int* mask_buffer_ptr, int rank_to_mask, bool mask, cudaS
 
 void cache_p2p_ptr(gpu_nixl_ctx* nixl_ctx, int rank_id, cudaStream_t stream);
 
+void probe_peer_counters(gpu_nixl_ctx* nixl_ctx, int rank_id,
+                         uint64_t offset_0, uint64_t offset_1,
+                         cudaStream_t stream);
+
 } // namespace ep_kernels
 
 } // namespace nixl_ep

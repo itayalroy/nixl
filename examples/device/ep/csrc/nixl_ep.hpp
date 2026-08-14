@@ -30,6 +30,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
 #include <torch/types.h>
+#include <cuda_runtime.h>
 #include <optional>
 #include <tuple>
 #include <vector>
@@ -157,6 +158,12 @@ private:
     uint64_t* last_ht_barrier_counter = nullptr;
     uint64_t* local_ht_barrier_counter = nullptr;
 
+    cudaStream_t debug_peer_probe_stream = nullptr;
+    cudaGraph_t debug_peer_probe_graph = nullptr;
+    cudaGraphExec_t debug_peer_probe_exec = nullptr;
+    int debug_peer_probe_rank = -1;
+    uint64_t debug_peer_probe_offsets[2] = {};
+
     /* Common private funcs */
     void _nixl_agent_init();
     void _nixl_agents_connect(const std::vector<int>& ranks, const std::vector<nixl_blob_t>& remote_mds = {});
@@ -169,6 +176,8 @@ private:
     void _nixl_ep_memory_views_destroy(void);
     void _nixl_ep_destroy(void);
     bool _is_rank_connected(int rank_id) const;
+    void _debug_capture_peer_probe(const EPLayout& layout);
+    void _debug_replay_peer_probe();
     /* high-throughput mode private funcs */
     void _ipc_handles_sync(const std::vector<std::optional<pybind11::bytearray>> &all_gathered_handles);
 

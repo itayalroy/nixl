@@ -68,6 +68,75 @@ uint64_t milliseconds_to_cycles(uint64_t milliseconds, int device_clock_rate_khz
 
 } // namespace
 
+void Buffer::_debug_capture_peer_probe(const EPLayout& layout) {
+    if (std::getenv("NIXL_EP_DEBUG_PEER_GRAPH") == nullptr ||
+        debug_peer_probe_exec != nullptr || remote_ranks.empty()) {
+        return;
+    }
+
+    cudaStreamCaptureStatus capture_status;
+    CUDA_CHECK(cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream(),
+                                     &capture_status));
+    if (capture_status != cudaStreamCaptureStatusNone) {
+        return;
+    }
+
+    debug_peer_probe_rank = remote_ranks.front();
+    for (int i = 0; i < 2; ++i) {
+        debug_peer_probe_offsets[i] =
+            reinterpret_cast<uint64_t>(
+                layout.buffers[i].dispatch_rdma_recv_count_buffer) -
+            reinterpret_cast<uint64_t>(rdma_buffer_ptr);
+    }
+
+    CUDA_CHECK(cudaStreamCreateWithFlags(&debug_peer_probe_stream,
+                                         cudaStreamNonBlocking));
+    CUDA_CHECK(cudaStreamBeginCapture(debug_peer_probe_stream,
+                                      cudaStreamCaptureModeThreadLocal));
+    ep_kernels::probe_peer_counters(
+        gpu_ctx_ptr, debug_peer_probe_rank, debug_peer_probe_offsets[0],
+        debug_peer_probe_offsets[1], debug_peer_probe_stream);
+    CUDA_CHECK(cudaStreamEndCapture(debug_peer_probe_stream,
+                                    &debug_peer_probe_graph));
+    CUDA_CHECK(cudaGraphInstantiate(&debug_peer_probe_exec,
+                                    debug_peer_probe_graph, nullptr, nullptr, 0));
+    std::fprintf(stderr,
+                 "NIXL_EP_PROBE rank=%d phase=captured peer=%d "
+                 "offset0=%lu offset1=%lu\n",
+                 rank, debug_peer_probe_rank, debug_peer_probe_offsets[0],
+                 debug_peer_probe_offsets[1]);
+    CUDA_CHECK(cudaGraphLaunch(debug_peer_probe_exec,
+                               debug_peer_probe_stream));
+    CUDA_CHECK(cudaStreamSynchronize(debug_peer_probe_stream));
+    std::fprintf(stderr,
+                 "NIXL_EP_PROBE rank=%d phase=initial_graph_ok peer=%d\n",
+                 rank, debug_peer_probe_rank);
+    std::fflush(stderr);
+}
+
+void Buffer::_debug_replay_peer_probe() {
+    if (debug_peer_probe_exec == nullptr) {
+        return;
+    }
+
+    ep_kernels::probe_peer_counters(
+        gpu_ctx_ptr, debug_peer_probe_rank, debug_peer_probe_offsets[0],
+        debug_peer_probe_offsets[1], debug_peer_probe_stream);
+    CUDA_CHECK(cudaStreamSynchronize(debug_peer_probe_stream));
+    std::fprintf(stderr,
+                 "NIXL_EP_PROBE rank=%d phase=expanded_eager_ok peer=%d\n",
+                 rank, debug_peer_probe_rank);
+    std::fflush(stderr);
+
+    CUDA_CHECK(cudaGraphLaunch(debug_peer_probe_exec,
+                               debug_peer_probe_stream));
+    CUDA_CHECK(cudaStreamSynchronize(debug_peer_probe_stream));
+    std::fprintf(stderr,
+                 "NIXL_EP_PROBE rank=%d phase=expanded_graph_ok peer=%d\n",
+                 rank, debug_peer_probe_rank);
+    std::fflush(stderr);
+}
+
 void Buffer::update_memory_buffers(int num_ranks, int num_experts_per_rank, int64_t num_rdma_bytes, int64_t num_nvl_bytes)
 {
     if (!available) {
@@ -530,6 +599,9 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 
         CUDA_CHECK(cudaDeviceSynchronize());
         dump_p2p_ptrs("after_recreate");
+        if (new_ranks.size() < remote_ranks.size()) {
+            _debug_replay_peer_probe();
+        }
     }
 
     if (activate) {
@@ -1087,6 +1159,7 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
     // Buffer control
     int max_num_experts = max_num_ranks * num_experts_per_rank;
     EPLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, max_num_ranks, max_num_experts);
+    _debug_capture_peer_probe(layout);
     EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
     auto buffer = layout.buffers[buffer_idx];
     auto next_buffer = layout.buffers[buffer_idx ^= 1];
@@ -1397,6 +1470,12 @@ void Buffer::_nixl_ep_init(void) {
 }
 
 void Buffer::_nixl_ep_destroy(void) {
+    if (debug_peer_probe_exec != nullptr)
+        cudaGraphExecDestroy(debug_peer_probe_exec);
+    if (debug_peer_probe_graph != nullptr)
+        cudaGraphDestroy(debug_peer_probe_graph);
+    if (debug_peer_probe_stream != nullptr)
+        cudaStreamDestroy(debug_peer_probe_stream);
     _nixl_ep_memory_views_destroy();
     if (gpu_ctx.p2p_ptrs != nullptr) {
         cudaFree(gpu_ctx.p2p_ptrs);

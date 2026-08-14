@@ -1143,6 +1143,27 @@ void cache_p2p_ptr(gpu_nixl_ctx* nixl_ctx, int rank_id, cudaStream_t stream) {
 }
 
 
+__global__ void probe_peer_counters_kernel(
+        nixl_ep::gpu_nixl_ctx* nixl_ctx_ptr, int rank_id,
+        uint64_t offset_0, uint64_t offset_1) {
+    auto nixl_ctx = *nixl_ctx_ptr;
+    auto remote_base = static_cast<uint8_t*>(nixl_ctx.p2p_ptrs[rank_id]);
+    EP_DEVICE_ASSERT(remote_base != nullptr);
+    atomicAdd_system(reinterpret_cast<unsigned long long*>(remote_base + offset_0), 0);
+    atomicAdd_system(reinterpret_cast<unsigned long long*>(remote_base + offset_1), 0);
+}
+
+void probe_peer_counters(gpu_nixl_ctx* nixl_ctx, int rank_id,
+                         uint64_t offset_0, uint64_t offset_1,
+                         cudaStream_t stream) {
+    constexpr int num_sms = 1;
+    constexpr int kNumThreads = 1;
+    SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
+    LAUNCH_KERNEL(&cfg, probe_peer_counters_kernel, nixl_ctx, rank_id,
+                  offset_0, offset_1);
+}
+
+
 template <int kNumThreads>
 __forceinline__ __device__ void barrier(nixl_ep::gpu_nixl_ctx nixl_ctx, int* mask_buffer_ptr, int thread_id, uint64_t timeout_cycles) {
     EP_DEVICE_ASSERT(kNumThreads >= nixl_ctx.max_num_ranks);
