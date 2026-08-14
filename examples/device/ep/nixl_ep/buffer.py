@@ -724,6 +724,9 @@ class Buffer:
         """
         self.runtime.update_mask_buffer(rank_to_mask, mask)
 
+    def debug_replay_peer_probe(self, phase: str) -> None:
+        self.runtime.debug_replay_peer_probe(phase)
+
     def query_mask_buffer(self, mask_status: torch.Tensor):
         """
         Query the runtime device mask status of all ranks.

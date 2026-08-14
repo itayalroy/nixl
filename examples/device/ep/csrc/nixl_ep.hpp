@@ -177,7 +177,7 @@ private:
     void _nixl_ep_destroy(void);
     bool _is_rank_connected(int rank_id) const;
     void _debug_capture_peer_probe(const EPLayout& layout);
-    void _debug_replay_peer_probe();
+    void _debug_replay_peer_probe(const char* phase = "expanded");
     /* high-throughput mode private funcs */
     void _ipc_handles_sync(const std::vector<std::optional<pybind11::bytearray>> &all_gathered_handles);
 
@@ -185,6 +185,8 @@ public:
     Buffer(int rank, bool explicitly_destroy, bool low_latency_mode, int timeout_ms);
 
     void update_memory_buffers(int num_ranks, int num_experts_per_rank, int64_t num_rdma_bytes, int64_t num_nvl_bytes = 0);
+
+    void debug_replay_peer_probe(const std::string& phase);
 
     void connect_ranks(const std::vector<int>& remote_ranks_list, const std::optional<std::vector<nixl_blob_t>>& remote_mds = std::nullopt, const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles = {}, bool activate = true);
 

@@ -114,7 +114,7 @@ void Buffer::_debug_capture_peer_probe(const EPLayout& layout) {
     std::fflush(stderr);
 }
 
-void Buffer::_debug_replay_peer_probe() {
+void Buffer::_debug_replay_peer_probe(const char* phase) {
     if (debug_peer_probe_exec == nullptr) {
         return;
     }
@@ -124,17 +124,21 @@ void Buffer::_debug_replay_peer_probe() {
         debug_peer_probe_offsets[1], debug_peer_probe_stream);
     CUDA_CHECK(cudaStreamSynchronize(debug_peer_probe_stream));
     std::fprintf(stderr,
-                 "NIXL_EP_PROBE rank=%d phase=expanded_eager_ok peer=%d\n",
-                 rank, debug_peer_probe_rank);
+                 "NIXL_EP_PROBE rank=%d phase=%s_eager_ok peer=%d\n",
+                 rank, phase, debug_peer_probe_rank);
     std::fflush(stderr);
 
     CUDA_CHECK(cudaGraphLaunch(debug_peer_probe_exec,
                                debug_peer_probe_stream));
     CUDA_CHECK(cudaStreamSynchronize(debug_peer_probe_stream));
     std::fprintf(stderr,
-                 "NIXL_EP_PROBE rank=%d phase=expanded_graph_ok peer=%d\n",
-                 rank, debug_peer_probe_rank);
+                 "NIXL_EP_PROBE rank=%d phase=%s_graph_ok peer=%d\n",
+                 rank, phase, debug_peer_probe_rank);
     std::fflush(stderr);
+}
+
+void Buffer::debug_replay_peer_probe(const std::string& phase) {
+    _debug_replay_peer_probe(phase.c_str());
 }
 
 void Buffer::update_memory_buffers(int num_ranks, int num_experts_per_rank, int64_t num_rdma_bytes, int64_t num_nvl_bytes)
@@ -1610,6 +1614,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     pybind11::class_<nixl_ep::Buffer>(m, "Buffer")
         .def(pybind11::init<int, bool, bool, int>())
         .def("update_memory_buffers", &nixl_ep::Buffer::update_memory_buffers)
+        .def("debug_replay_peer_probe", &nixl_ep::Buffer::debug_replay_peer_probe)
         .def("barrier", &nixl_ep::Buffer::barrier)
         .def("connect_ranks", [](nixl_ep::Buffer &buffer, const std::vector<int>& remote_ranks, const std::optional<std::vector<pybind11::bytes>>& remote_mds, const std::vector<std::optional<pybind11::bytearray>> &all_gathered_handles, bool activate) {
             buffer.connect_ranks(remote_ranks, nixl_ep::convert_mds(remote_mds), all_gathered_handles, activate);
