@@ -151,7 +151,9 @@ private:
     std::vector<NixlPeerInfo> nixl_peer_info;
     NixlPeerInfo my_peer_info;
     nixl_ep::gpu_nixl_ctx gpu_ctx;
+    nixl_ep::gpu_nixl_ctx staged_gpu_ctx{};
     nixl_ep::gpu_nixl_ctx* gpu_ctx_ptr = nullptr;
+    std::vector<int> staged_ranks;
     uint64_t* last_ht_barrier_counter = nullptr;
     uint64_t* local_ht_barrier_counter = nullptr;
 
@@ -163,8 +165,9 @@ private:
     void _nixl_agents_peer_info_cleanup(const std::vector<int>& ranks);
 
     void _nixl_ep_init(void);
-    void _nixl_ep_memory_views_create(void);
-    void _nixl_ep_memory_views_destroy(void);
+    void _nixl_ep_memory_views_create(gpu_nixl_ctx& ctx);
+    void _nixl_ep_memory_views_destroy(gpu_nixl_ctx& ctx);
+    void _nixl_ep_memory_views_commit(void);
     void _nixl_ep_destroy(void);
     bool _is_rank_connected(int rank_id) const;
     /* high-throughput mode private funcs */
