@@ -478,6 +478,7 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
     }
 
     if (!new_ranks.empty()) {
+        const bool expanding = !remote_ranks.empty();
         _nixl_agents_connect(new_ranks, new_ranks_mds);
 
         _nixl_agents_peer_info_gather(new_ranks);
@@ -486,8 +487,13 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 
         _nixl_ep_memory_views_create();
 
-        for (int remote_rank : new_ranks)
-            ep_kernels::cache_p2p_ptr(gpu_ctx_ptr, remote_rank, comm_stream);
+        if (expanding) {
+            CUDA_CHECK(cudaMemset(gpu_ctx.p2p_ptrs, 0,
+                                  max_num_ranks * sizeof(void*)));
+        } else {
+            for (int remote_rank : new_ranks)
+                ep_kernels::cache_p2p_ptr(gpu_ctx_ptr, remote_rank, comm_stream);
+        }
 
         CUDA_CHECK(cudaDeviceSynchronize());
     }
