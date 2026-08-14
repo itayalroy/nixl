@@ -482,7 +482,10 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 
         _nixl_agents_peer_info_gather(new_ranks);
 
+        auto connected_ranks = std::move(remote_ranks);
+        remote_ranks = new_ranks;
         _nixl_ep_memory_views_create();
+        remote_ranks = std::move(connected_ranks);
 
         for (int remote_rank : new_ranks)
             ep_kernels::cache_p2p_ptr(gpu_ctx_ptr, remote_rank, comm_stream);
