@@ -91,22 +91,6 @@ bool Buffer::_is_rank_connected(int rank_id) const {
     return rank_id == rank or std::find(remote_ranks.begin(), remote_ranks.end(), rank_id) != remote_ranks.end();
 }
 
-void Buffer::set_active_rank_bound(int bound) {
-    EP_HOST_ASSERT(bound > 0 && "active_rank_bound must be positive");
-    active_rank_bound = bound;
-}
-
-void Buffer::_refresh_active_rank_bound() {
-    int bound = 0;
-    for (int rank_id = max_num_ranks - 1; rank_id >= 0; --rank_id) {
-        if (active_ranks[rank_id]) {
-            bound = rank_id + 1;
-            break;
-        }
-    }
-    set_active_rank_bound(bound);
-}
-
 void Buffer::init(int num_ranks, int num_experts_per_rank, int64_t num_nvl_bytes, int64_t num_rdma_bytes)
 {
     EP_HOST_ASSERT(num_ranks > 0);
@@ -140,6 +124,13 @@ void Buffer::init(int num_ranks, int num_experts_per_rank, int64_t num_nvl_bytes
     // Get device info
     int device_clock_rate_khz = 0;
     CUDA_CHECK(cudaDeviceGetAttribute(&num_device_sms, cudaDevAttrMultiProcessorCount, device_id));
+    num_expert_sms = 0;
+    for (int rank_bound = 1; rank_bound <= max_num_ranks; ++rank_bound) {
+        const int num_experts = rank_bound * num_experts_per_rank;
+        const int num_warp_groups = ceil_div(num_experts, num_device_sms);
+        num_expert_sms = std::max(
+            num_expert_sms, ceil_div(num_experts, num_warp_groups));
+    }
     CUDA_CHECK(cudaDeviceGetAttribute(&device_clock_rate_khz, cudaDevAttrClockRate, device_id));
     timeout_cycles = milliseconds_to_cycles(timeout_ms, device_clock_rate_khz);
     int denom_sms = std::max(1, num_device_sms / 2);
@@ -188,14 +179,15 @@ void Buffer::init(int num_ranks, int num_experts_per_rank, int64_t num_nvl_bytes
     CUDA_CHECK(cudaMemset(rdma_buffer_ptr, 0, num_rdma_bytes));
 
     // Allocate and clean shrink buffer
-    int num_mask_buffer_bytes = max_num_ranks * sizeof(int);
+    // The final entry lets graph replays read the current rank bound.
+    int num_mask_buffer_bytes = (max_num_ranks + 1) * sizeof(int);
     m_mask_alloc = std::make_unique<vmm_region>(static_cast<size_t>(num_mask_buffer_bytes));
     mask_buffer_ptr = static_cast<int *>(m_mask_alloc->ptr());
     CUDA_CHECK(cudaMemset(mask_buffer_ptr, 0xff, num_mask_buffer_bytes));
     CUDA_CHECK(cudaMemset(mask_buffer_ptr + rank, 0, sizeof(int)));
-    active_ranks.assign(max_num_ranks, false);
-    active_ranks[rank] = true;
-    set_active_rank_bound(rank + 1);
+    const int initial_rank_bound = rank + 1;
+    CUDA_CHECK(cudaMemcpy(mask_buffer_ptr + max_num_ranks, &initial_rank_bound,
+                          sizeof(int), cudaMemcpyHostToDevice));
 
     int num_sync_buffer_bytes = max_num_ranks * sizeof(int);
     m_sync_alloc = std::make_unique<vmm_region>(static_cast<size_t>(num_sync_buffer_bytes));
@@ -1056,7 +1048,7 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
     if (dispatch_wait_recv_cost_stats.has_value()) {
         EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->scalar_type() == torch::kInt64);
         EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->dim() == 1 and dispatch_wait_recv_cost_stats->is_contiguous());
-        EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->size(0) == active_rank_bound);
+        EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->size(0) == max_num_ranks);
     }
 
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
@@ -1078,26 +1070,26 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
         stream_wait(launch_stream, compute_stream);
 
     // Allocate packed tensors
-    auto packed_recv_x = torch::empty({num_experts_per_rank, active_rank_bound * num_max_dispatch_tokens_per_rank, hidden},
+    auto packed_recv_x = torch::empty({num_experts_per_rank, max_num_ranks * num_max_dispatch_tokens_per_rank, hidden},
                                       x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn: torch::kBFloat16));
-    auto packed_recv_src_info = torch::empty({num_experts_per_rank, active_rank_bound * num_max_dispatch_tokens_per_rank}, torch::dtype(torch::kInt32).device(torch::kCUDA));
-    auto packed_recv_layout_range = torch::empty({num_experts_per_rank, active_rank_bound}, torch::dtype(torch::kInt64).device(torch::kCUDA));
+    auto packed_recv_src_info = torch::empty({num_experts_per_rank, max_num_ranks * num_max_dispatch_tokens_per_rank}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    auto packed_recv_layout_range = torch::empty({num_experts_per_rank, max_num_ranks}, torch::dtype(torch::kInt64).device(torch::kCUDA));
     auto packed_recv_count = torch::empty({num_experts_per_rank}, torch::dtype(torch::kInt32).device(torch::kCUDA));
 
     // Allocate column-majored scales
     auto packed_recv_x_scales = std::optional<torch::Tensor>();
     void* packed_recv_x_scales_ptr = nullptr;
-    EP_HOST_ASSERT((active_rank_bound * num_max_dispatch_tokens_per_rank) % 4 == 0 and "TMA requires the number of tokens to be multiple of 4");
+    EP_HOST_ASSERT((max_num_ranks * num_max_dispatch_tokens_per_rank) % 4 == 0 and "TMA requires the number of tokens to be multiple of 4");
 
     if (use_fp8) {
         // TODO: support unaligned cases
         EP_HOST_ASSERT(hidden % 512 == 0);
         if (not use_ue8m0) {
-            packed_recv_x_scales = torch::empty({num_experts_per_rank, hidden / 128, active_rank_bound * num_max_dispatch_tokens_per_rank},
+            packed_recv_x_scales = torch::empty({num_experts_per_rank, hidden / 128, max_num_ranks * num_max_dispatch_tokens_per_rank},
                                                 torch::dtype(torch::kFloat32).device(torch::kCUDA));
         } else {
             EP_HOST_ASSERT(round_scale);
-            packed_recv_x_scales = torch::empty({num_experts_per_rank, hidden / 512, active_rank_bound * num_max_dispatch_tokens_per_rank},
+            packed_recv_x_scales = torch::empty({num_experts_per_rank, hidden / 512, max_num_ranks * num_max_dispatch_tokens_per_rank},
                                                 torch::dtype(torch::kInt).device(torch::kCUDA));
         }
         packed_recv_x_scales = torch::transpose(packed_recv_x_scales.value(), 1, 2);
@@ -1118,10 +1110,10 @@ Buffer::dispatch(const torch::Tensor& x, const torch::Tensor& topk_idx,
                               x.data_ptr(), topk_idx.data_ptr<topk_idx_t>(),
                                next_clean_meta.first, next_clean_meta.second,
                                num_tokens, hidden, num_max_dispatch_tokens_per_rank,
-                               num_topk, active_rank_bound, num_experts_per_rank, rank,
+                               num_topk, max_num_ranks, num_experts_per_rank, rank,
                                use_fp8, round_scale, use_ue8m0,
                                timeout_cycles,
-                               workspace, num_device_sms,
+                               workspace, num_expert_sms,
                                launch_stream, phases, gpu_ctx_ptr);
     };
     launcher(return_recv_hook ? EP_SEND_PHASE : (EP_SEND_PHASE | EP_RECV_PHASE));
@@ -1157,7 +1149,7 @@ Buffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const tor
     // Tensor checks
     EP_HOST_ASSERT(x.dim() == 3 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
     EP_HOST_ASSERT(x.size(0) == num_experts_per_rank);
-    EP_HOST_ASSERT(x.size(1) == active_rank_bound * num_max_dispatch_tokens_per_rank);
+    EP_HOST_ASSERT(x.size(1) == max_num_ranks * num_max_dispatch_tokens_per_rank);
     EP_HOST_ASSERT(x.size(2) % sizeof(int4) == 0 and x.size(2) % 128 == 0);
     EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
     EP_HOST_ASSERT(topk_idx.size(0) == topk_weights.size(0) and topk_idx.size(1) == topk_weights.size(1));
@@ -1167,15 +1159,15 @@ Buffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const tor
     EP_HOST_ASSERT(topk_weights.scalar_type() == torch::kFloat32);
     EP_HOST_ASSERT(src_info.dim() == 2 and src_info.is_contiguous());
     EP_HOST_ASSERT(src_info.scalar_type() == torch::kInt32 and x.size(0) == src_info.size(0));
-    EP_HOST_ASSERT(src_info.size(1) == active_rank_bound * num_max_dispatch_tokens_per_rank);
+    EP_HOST_ASSERT(src_info.size(1) == max_num_ranks * num_max_dispatch_tokens_per_rank);
     EP_HOST_ASSERT(layout_range.dim() == 2 and layout_range.is_contiguous());
     EP_HOST_ASSERT(layout_range.scalar_type() == torch::kInt64);
-    EP_HOST_ASSERT(layout_range.size(0) == num_experts_per_rank and layout_range.size(1) == active_rank_bound);
+    EP_HOST_ASSERT(layout_range.size(0) == num_experts_per_rank and layout_range.size(1) == max_num_ranks);
 
     if (combine_wait_recv_cost_stats.has_value()) {
         EP_HOST_ASSERT(combine_wait_recv_cost_stats->scalar_type() == torch::kInt64);
         EP_HOST_ASSERT(combine_wait_recv_cost_stats->dim() == 1 and combine_wait_recv_cost_stats->is_contiguous());
-        EP_HOST_ASSERT(combine_wait_recv_cost_stats->size(0) == active_rank_bound);
+        EP_HOST_ASSERT(combine_wait_recv_cost_stats->size(0) == max_num_ranks);
     }
 
     auto hidden = static_cast<int>(x.size(2));
@@ -1220,9 +1212,9 @@ Buffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const tor
                               combine_wait_recv_cost_stats.has_value() ? combine_wait_recv_cost_stats->data_ptr<int64_t>() : nullptr,
                               next_clean_meta.first, next_clean_meta.second,
                               num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
-                              num_topk, active_rank_bound, num_experts_per_rank, rank,
-                             use_logfmt, timeout_cycles,
-                              workspace, num_device_sms,
+                              num_topk, max_num_ranks, num_experts_per_rank, rank,
+                              use_logfmt, timeout_cycles,
+                              workspace, num_expert_sms, num_device_sms,
                               launch_stream, phases, zero_copy, gpu_ctx_ptr);
     };
     launcher(return_recv_hook ? EP_SEND_PHASE : (EP_SEND_PHASE | EP_RECV_PHASE));
@@ -1257,8 +1249,8 @@ Buffer::get_next_combine_buffer(int num_max_dispatch_tokens_per_rank, int hidden
 
     EP_HOST_ASSERT(buffer.num_bytes_per_combine_msg % elementSize(torch::kBFloat16) == 0);
     return torch::from_blob(buffer.combine_rdma_send_buffer_data_start,
-                            {num_experts_per_rank, active_rank_bound * num_max_dispatch_tokens_per_rank, hidden},
-                            {active_rank_bound * num_max_dispatch_tokens_per_rank * num_msg_elems, num_msg_elems, 1},
+                            {num_experts_per_rank, max_num_ranks * num_max_dispatch_tokens_per_rank, hidden},
+                            {max_num_ranks * num_max_dispatch_tokens_per_rank * num_msg_elems, num_msg_elems, 1},
                             torch::TensorOptions().dtype(dtype).device(torch::kCUDA));
 }
 
@@ -1276,9 +1268,9 @@ void Buffer::update_mask_buffer(int rank_to_mask, bool mask) {
     EP_HOST_ASSERT((rank_to_mask != rank or !mask) && "cannot mask the local rank");
     if (!mask)
         EP_HOST_ASSERT(_is_rank_connected(rank_to_mask) && "cannot unmask an unconnected rank");
-    active_ranks[rank_to_mask] = !mask;
-    _refresh_active_rank_bound();
-    ep_kernels::update_mask_buffer(mask_buffer_ptr, rank_to_mask, mask, at::cuda::getCurrentCUDAStream());
+    ep_kernels::update_mask_buffer(mask_buffer_ptr, max_num_ranks,
+                                   rank_to_mask, mask,
+                                   at::cuda::getCurrentCUDAStream());
 }
 
 void
@@ -1295,15 +1287,18 @@ Buffer::query_mask_buffer(const torch::Tensor &mask_status) const {
 
 void Buffer::clean_mask_buffer() {
     EP_HOST_ASSERT(mask_buffer_ptr != nullptr and "Shrink mode must be enabled");
-    std::vector<int> mask(max_num_ranks, 1);
+    std::vector<int> mask(max_num_ranks + 1, 1);
+    int launch_rank_bound = 0;
     for (int rank_id = 0; rank_id < max_num_ranks; ++rank_id) {
         const bool active = _is_rank_connected(rank_id);
-        active_ranks[rank_id] = active;
         mask[rank_id] = !active;
+        if (active)
+            launch_rank_bound = rank_id + 1;
     }
-    _refresh_active_rank_bound();
+    EP_HOST_ASSERT(launch_rank_bound > 0);
+    mask[max_num_ranks] = launch_rank_bound;
     CUDA_CHECK(cudaMemcpyAsync(mask_buffer_ptr, mask.data(),
-                               max_num_ranks * sizeof(int), cudaMemcpyHostToDevice,
+                               (max_num_ranks + 1) * sizeof(int), cudaMemcpyHostToDevice,
                                at::cuda::getCurrentCUDAStream()));
 }
 
