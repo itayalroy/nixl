@@ -26,6 +26,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <functional>
 #include <limits>
 #include <cuda_runtime.h>
 #include <memory>
@@ -48,6 +50,7 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <sstream>
+#include <thread>
 #include <unordered_set>
 
 #define NIXL_ETCD_WATCH_TIMEOUT std::chrono::microseconds(1000000000) // 1000 seconds
@@ -63,6 +66,51 @@ void sleep_ms(int milliseconds) {
 uint64_t milliseconds_to_cycles(uint64_t milliseconds, int device_clock_rate_khz) {
     EP_HOST_ASSERT(device_clock_rate_khz > 0);
     return milliseconds * static_cast<uint64_t>(device_clock_rate_khz);
+}
+
+bool connect_timeline_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NIXL_EP_CONNECT_TIMELINE");
+        return value != nullptr and std::string(value) == "1";
+    }();
+    return enabled;
+}
+
+uint64_t connect_timeline_wall_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+uint64_t connect_timeline_mono_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+std::string connect_timeline_ranks(const std::vector<int>& ranks) {
+    std::ostringstream stream;
+    for (size_t i = 0; i < ranks.size(); ++i) {
+        if (i > 0) stream << ',';
+        stream << ranks[i];
+    }
+    return stream.str();
+}
+
+void connect_timeline(int rank, const char* event,
+                      const std::vector<int>& peers = {},
+                      const std::string& details = "") {
+    if (!connect_timeline_enabled()) return;
+    const auto thread_id = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    std::fprintf(
+        stderr,
+        "NIXL_EP_CONNECT_TIMELINE wall_ns=%llu mono_ns=%llu pid=%d tid=%zu "
+        "rank=%d event=%s peers=%s %s\n",
+        static_cast<unsigned long long>(connect_timeline_wall_ns()),
+        static_cast<unsigned long long>(connect_timeline_mono_ns()), getpid(),
+        thread_id, rank, event, connect_timeline_ranks(peers).c_str(),
+        details.c_str());
+    std::fflush(stderr);
 }
 
 } // namespace
@@ -389,6 +437,7 @@ void Buffer::barrier() {
 void Buffer::_nixl_agents_connect(const std::vector<int>& ranks, const std::vector<nixl_blob_t>& remote_mds) {
     EP_HOST_ASSERT(!ranks.empty());
     EP_HOST_ASSERT(remote_mds.empty() || remote_mds.size() == ranks.size());
+    connect_timeline(rank, "agents_connect_begin", ranks);
 
     // Assuming ranks vector does not include current rank and has only new ranks
     remote_ranks.insert(remote_ranks.end(), ranks.begin(), ranks.end());
@@ -400,6 +449,7 @@ void Buffer::_nixl_agents_connect(const std::vector<int>& ranks, const std::vect
     for (size_t i = 0; i < ranks.size(); i++) {
         int remote_rank = ranks[i];
         std::string agent_name;
+        const auto start_ns = connect_timeline_mono_ns();
 
         nixl_status_t status = remote_mds.empty()
             ? nixl_agent_info->agent->fetchRemoteMD(nixl_agent_info->remote_agent_names[remote_rank])
@@ -409,11 +459,15 @@ void Buffer::_nixl_agents_connect(const std::vector<int>& ranks, const std::vect
             throw std::runtime_error("Failed to get metadata for remote agent " +
                                     std::to_string(remote_rank) + ", status: " + std::to_string(status));
         }
+        connect_timeline(
+            rank, "remote_md_request", {remote_rank},
+            "elapsed_ns=" + std::to_string(connect_timeline_mono_ns() - start_ns));
     }
 
     // Wait for all remote metadata to be available
     std::vector<bool> peer_ready(max_num_ranks, false);
     int peers_remaining = static_cast<int>(ranks.size());
+    auto last_report = std::chrono::steady_clock::now();
 
     while (peers_remaining > 0) {
         for (int remote_rank : ranks) {
@@ -423,21 +477,36 @@ void Buffer::_nixl_agents_connect(const std::vector<int>& ranks, const std::vect
             if (nixl_agent_info->agent->checkRemoteMD(std::to_string(remote_rank), empty_descs) == NIXL_SUCCESS) {
                 peer_ready[remote_rank] = true;
                 peers_remaining--;
+                connect_timeline(rank, "remote_md_ready", {remote_rank});
             }
         }
         if (peers_remaining > 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_report >= std::chrono::seconds(1)) {
+                std::vector<int> pending;
+                for (int remote_rank : ranks) {
+                    if (!peer_ready[remote_rank]) pending.push_back(remote_rank);
+                }
+                connect_timeline(rank, "remote_md_pending", pending);
+                last_report = now;
+            }
             sleep_ms(10);
         }
     }
+    connect_timeline(rank, "agents_connect_end", ranks);
 }
 
 void Buffer::_nixl_agents_peer_info_gather(std::vector<int>& ranks) {
+    connect_timeline(rank, "peer_info_send_begin", ranks);
     for (int remote_rank : ranks) {
         std::string my_peer_info_str(reinterpret_cast<const char*>(&my_peer_info), sizeof(NixlPeerInfo));
         nixl_agent_info->agent->genNotif(std::to_string(remote_rank), my_peer_info_str);
     }
+    connect_timeline(rank, "peer_info_send_end", ranks);
 
     for (int remote_rank : ranks) {
+        auto last_report = std::chrono::steady_clock::now();
+        uint64_t polls = 0;
         do {
             nixl_notifs_t notif_map;
             nixl_agent_info->agent->getNotifs(notif_map);
@@ -448,8 +517,17 @@ void Buffer::_nixl_agents_peer_info_gather(std::vector<int>& ranks) {
                 nixl_peer_info[remote_peer_info.rank] = remote_peer_info;
                 nixl_agent_info->wire_up_done[remote_peer_info.rank] = true;
             }
+            if (++polls % 10000 == 0) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now - last_report >= std::chrono::seconds(1)) {
+                    connect_timeline(rank, "peer_info_pending", {remote_rank});
+                    last_report = now;
+                }
+            }
         } while (!nixl_agent_info->wire_up_done[remote_rank]);
+        connect_timeline(rank, "peer_info_ready", {remote_rank});
     }
+    connect_timeline(rank, "peer_info_end", ranks);
 }
 
 void Buffer::_ipc_handles_sync(const std::vector<std::optional<pybind11::bytearray>> &all_gathered_handles = {}) {
@@ -477,6 +555,9 @@ void Buffer::_ipc_handles_sync(const std::vector<std::optional<pybind11::bytearr
 
 void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std::optional<std::vector<nixl_blob_t>>& remote_mds,
     const std::vector<std::optional<pybind11::bytearray>> &all_gathered_handles, bool activate) {
+    const auto connect_start_ns = connect_timeline_mono_ns();
+    connect_timeline(rank, "cpp_connect_begin", remote_ranks_list,
+                     "activate=" + std::to_string(activate));
     EP_HOST_ASSERT(!remote_ranks_list.empty());
     EP_HOST_ASSERT(!remote_mds.has_value() || remote_mds->size() == remote_ranks_list.size());
 
@@ -491,6 +572,7 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
     if (all_gathered_handles.size() > 0)
         _ipc_handles_sync(all_gathered_handles);
 
+    const auto filter_start_ns = connect_timeline_mono_ns();
     for (size_t i = 0; i < remote_ranks_list.size(); i++) {
         int remote_rank = remote_ranks_list[i];
         EP_HOST_ASSERT(remote_rank >= 0 and remote_rank < max_num_ranks);
@@ -499,19 +581,34 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
             continue;
 
         new_ranks.push_back(remote_rank);
+        const auto memset_start_ns = connect_timeline_mono_ns();
         CUDA_CHECK(cudaMemset(sync_count_ptr + remote_rank, 0, sizeof(int)));
         CUDA_CHECK(cudaMemset(sync_buffer_ptr + remote_rank, 0, sizeof(int)));
+        connect_timeline(
+            rank, "rank_sync_memset", {remote_rank},
+            "elapsed_ns=" +
+                std::to_string(connect_timeline_mono_ns() - memset_start_ns));
 
         if (remote_mds.has_value())
             new_ranks_mds.push_back((*remote_mds)[i]);
     }
+    connect_timeline(
+        rank, "filter_new_ranks_end", new_ranks,
+        "elapsed_ns=" +
+            std::to_string(connect_timeline_mono_ns() - filter_start_ns));
 
     if (!new_ranks.empty()) {
         _nixl_agents_connect(new_ranks, new_ranks_mds);
 
         _nixl_agents_peer_info_gather(new_ranks);
 
+        const auto stage_start_ns = connect_timeline_mono_ns();
+        connect_timeline(rank, "memory_views_stage_begin", new_ranks);
         _nixl_ep_memory_views_stage();
+        connect_timeline(
+            rank, "memory_views_stage_end", new_ranks,
+            "elapsed_ns=" +
+                std::to_string(connect_timeline_mono_ns() - stage_start_ns));
     }
 
     if (activate) {
@@ -523,6 +620,10 @@ void Buffer::connect_ranks(const std::vector<int>& remote_ranks_list, const std:
 
     // Ready to use
     available = true;
+    connect_timeline(
+        rank, "cpp_connect_end", remote_ranks_list,
+        "activate=" + std::to_string(activate) + " elapsed_ns=" +
+            std::to_string(connect_timeline_mono_ns() - connect_start_ns));
 }
 
 void Buffer::disconnect_ranks(const std::vector<int>& remote_ranks_list) {
@@ -1330,7 +1431,12 @@ std::string Buffer::get_local_metadata() const {
 
 void Buffer::_nixl_ep_memory_views_stage(void) {
     NixlMemoryViews& memory_views = staged_memory_views;
+    auto phase_start_ns = connect_timeline_mono_ns();
     _nixl_ep_memory_views_destroy(memory_views);
+    connect_timeline(
+        rank, "staged_memory_views_destroy_end", remote_ranks,
+        "elapsed_ns=" +
+            std::to_string(connect_timeline_mono_ns() - phase_start_ns));
     nixl_remote_dlist_t remote_descs(VRAM_SEG);
     nixl_remote_dlist_t barrier_descs(VRAM_SEG);
     nixl_local_dlist_t local_descs(VRAM_SEG);
@@ -1345,10 +1451,25 @@ void Buffer::_nixl_ep_memory_views_stage(void) {
         barrier_descs.addDesc(nixlRemoteDesc((uintptr_t)nixl_peer_info[r].sync_buffer_ptr, max_num_ranks * sizeof(int), nixl_peer_info[r].device_id, remote_agent_name));
     }
 
+    phase_start_ns = connect_timeline_mono_ns();
     EP_HOST_ASSERT(nixl_agent_info->agent->prepMemView(local_descs, memory_views.local, &nixl_agent_info->extra_params) == NIXL_SUCCESS);
+    connect_timeline(
+        rank, "prep_local_memory_view_end", remote_ranks,
+        "elapsed_ns=" +
+            std::to_string(connect_timeline_mono_ns() - phase_start_ns));
     if (!remote_ranks.empty()) {
+        phase_start_ns = connect_timeline_mono_ns();
         EP_HOST_ASSERT(nixl_agent_info->agent->prepMemView(remote_descs, memory_views.remote, &nixl_agent_info->extra_params) == NIXL_SUCCESS);
+        connect_timeline(
+            rank, "prep_remote_memory_view_end", remote_ranks,
+            "elapsed_ns=" +
+                std::to_string(connect_timeline_mono_ns() - phase_start_ns));
+        phase_start_ns = connect_timeline_mono_ns();
         EP_HOST_ASSERT(nixl_agent_info->agent->prepMemView(barrier_descs, memory_views.barrier, &nixl_agent_info->extra_params) == NIXL_SUCCESS);
+        connect_timeline(
+            rank, "prep_barrier_memory_view_end", remote_ranks,
+            "elapsed_ns=" +
+                std::to_string(connect_timeline_mono_ns() - phase_start_ns));
 
         if (!low_latency_mode && max_num_ranks > NUM_MAX_NVL_PEERS) {
             nixl_remote_dlist_t ht_barrier_descs(VRAM_SEG);
@@ -1356,7 +1477,12 @@ void Buffer::_nixl_ep_memory_views_stage(void) {
                 std::string remote_agent_name = remote_set.count(r) ? nixl_agent_info->remote_agent_names[r] : nixl_null_agent;
                 ht_barrier_descs.addDesc(nixlRemoteDesc((uintptr_t)nixl_peer_info[r].ht_barrier_ptr, sizeof(uint64_t), nixl_peer_info[r].device_id, remote_agent_name));
             }
+            phase_start_ns = connect_timeline_mono_ns();
             EP_HOST_ASSERT(nixl_agent_info->agent->prepMemView(ht_barrier_descs, memory_views.ht_barrier, &nixl_agent_info->extra_params) == NIXL_SUCCESS);
+            connect_timeline(
+                rank, "prep_ht_barrier_memory_view_end", remote_ranks,
+                "elapsed_ns=" +
+                    std::to_string(connect_timeline_mono_ns() - phase_start_ns));
         }
     }
 }
@@ -1372,17 +1498,33 @@ void Buffer::_nixl_ep_memory_views_destroy(NixlMemoryViews& memory_views) {
 void Buffer::_nixl_ep_memory_views_commit(void) {
     if (!staged_memory_views.local)
         return;
+    auto phase_start_ns = connect_timeline_mono_ns();
+    connect_timeline(rank, "memory_views_commit_begin", remote_ranks);
     CUDA_CHECK(cudaDeviceSynchronize());
+    connect_timeline(
+        rank, "memory_views_commit_pre_sync_end", remote_ranks,
+        "elapsed_ns=" +
+            std::to_string(connect_timeline_mono_ns() - phase_start_ns));
     std::swap(active_memory_views, staged_memory_views);
     gpu_ctx.local_mvh = active_memory_views.local;
     gpu_ctx.remote_mvh = active_memory_views.remote;
     gpu_ctx.barrier_mvh = active_memory_views.barrier;
     gpu_ctx.ht_barrier_mvh = active_memory_views.ht_barrier;
+    phase_start_ns = connect_timeline_mono_ns();
     CUDA_CHECK(cudaMemcpy(gpu_ctx_ptr, &gpu_ctx, sizeof(gpu_ctx), cudaMemcpyHostToDevice));
     for (int remote_rank : remote_ranks)
         ep_kernels::cache_p2p_ptr(gpu_ctx_ptr, remote_rank, comm_stream);
     CUDA_CHECK(cudaDeviceSynchronize());
+    connect_timeline(
+        rank, "memory_views_commit_gpu_update_end", remote_ranks,
+        "elapsed_ns=" +
+            std::to_string(connect_timeline_mono_ns() - phase_start_ns));
+    phase_start_ns = connect_timeline_mono_ns();
     _nixl_ep_memory_views_destroy(staged_memory_views);
+    connect_timeline(
+        rank, "memory_views_commit_end", remote_ranks,
+        "retired_destroy_ns=" +
+            std::to_string(connect_timeline_mono_ns() - phase_start_ns));
 }
 
 void Buffer::_nixl_ep_init(void) {

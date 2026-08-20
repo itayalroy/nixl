@@ -19,6 +19,8 @@
 # limitations under the License.
 
 import os
+import threading
+import time
 from contextlib import contextmanager
 from datetime import timedelta
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -38,6 +40,18 @@ if TYPE_CHECKING:
 
 
 DEFAULT_TIMEOUT_MS = 30_000
+
+
+def _connect_timeline(rank: int, event: str, **fields) -> None:
+    if os.environ.get("NIXL_EP_CONNECT_TIMELINE", "0") != "1":
+        return
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(
+        f"NIXL_EP_CONNECT_TIMELINE wall_ns={time.time_ns()} "
+        f"mono_ns={time.monotonic_ns()} pid={os.getpid()} "
+        f"tid={threading.get_native_id()} rank={rank} event={event} {details}",
+        flush=True,
+    )
 
 
 class Buffer:
@@ -799,20 +813,38 @@ class Buffer:
     def _fetch_remote_metadata_from_tcp_store(self, remote_ranks: List[int]):
         assert self.tcp_store_group is not None, "TCPStore group is not set"
         md_key = f"NIXL_EP/{self.rank}"
+        _connect_timeline(self.rank, "get_local_metadata_begin", peers=remote_ranks)
         nixl_metadata_bytes = self.runtime.get_local_metadata()
+        _connect_timeline(self.rank, "get_local_metadata_end", peers=remote_ranks)
+        _connect_timeline(
+            self.rank, "tcp_store_set_begin", peers=remote_ranks, key=md_key
+        )
         self.tcp_store_group.set(md_key, nixl_metadata_bytes)
+        _connect_timeline(self.rank, "tcp_store_set_end", peers=remote_ranks)
 
         remote_md_keys = [f"NIXL_EP/{rank}" for rank in remote_ranks]
         if remote_md_keys:
+            _connect_timeline(
+                self.rank, "tcp_store_wait_begin", peers=remote_ranks
+            )
             self.tcp_store_group.wait(remote_md_keys, timedelta(seconds=300))
+            _connect_timeline(self.rank, "tcp_store_wait_end", peers=remote_ranks)
+            _connect_timeline(
+                self.rank, "tcp_store_multi_get_begin", peers=remote_ranks
+            )
             remote_mds = self.tcp_store_group.multi_get(remote_md_keys)
+            _connect_timeline(
+                self.rank, "tcp_store_multi_get_end", peers=remote_ranks
+            )
         else:
             remote_mds = []
 
         try:
             yield remote_mds
         finally:
+            _connect_timeline(self.rank, "tcp_store_delete_begin", key=md_key)
             self.tcp_store_group.delete_key(md_key)
+            _connect_timeline(self.rank, "tcp_store_delete_end", key=md_key)
 
     def _ht_connect_ranks(self, remote_ranks: List[int]) -> None:
         if self.group is not None:
@@ -848,22 +880,51 @@ class Buffer:
                          The current rank will be automatically filtered out.
             activate: in low-latency mode, if False, keep newly connected ranks masked until update_mask_buffer(..., False).
         """
-        if self.low_latency_mode:
-            if self.tcp_store_group is not None:
-                with self._fetch_remote_metadata_from_tcp_store(
-                    remote_ranks
-                ) as remote_mds:
-                    self.runtime.connect_ranks(
-                        remote_ranks, remote_mds, activate=activate
-                    )
+        start_ns = time.monotonic_ns()
+        _connect_timeline(
+            self.rank,
+            "python_connect_begin",
+            peers=remote_ranks,
+            activate=activate,
+        )
+        try:
+            if self.low_latency_mode:
+                if self.tcp_store_group is not None:
+                    with self._fetch_remote_metadata_from_tcp_store(
+                        remote_ranks
+                    ) as remote_mds:
+                        _connect_timeline(
+                            self.rank,
+                            "runtime_connect_begin",
+                            peers=remote_ranks,
+                            activate=activate,
+                        )
+                        self.runtime.connect_ranks(
+                            remote_ranks, remote_mds, activate=activate
+                        )
+                        _connect_timeline(
+                            self.rank,
+                            "runtime_connect_end",
+                            peers=remote_ranks,
+                            activate=activate,
+                        )
+                else:
+                    self.runtime.connect_ranks(remote_ranks, activate=activate)
             else:
-                self.runtime.connect_ranks(remote_ranks, activate=activate)
-        else:
-            if not activate:
-                raise ValueError(
-                    "connect_ranks(activate=False) is only supported in low-latency mode"
-                )
-            self._ht_connect_ranks(remote_ranks)
+                if not activate:
+                    raise ValueError(
+                        "connect_ranks(activate=False) is only supported in "
+                        "low-latency mode"
+                    )
+                self._ht_connect_ranks(remote_ranks)
+        finally:
+            _connect_timeline(
+                self.rank,
+                "python_connect_end",
+                peers=remote_ranks,
+                activate=activate,
+                elapsed_ns=time.monotonic_ns() - start_ns,
+            )
 
     def disconnect_ranks(self, remote_ranks: List[int]) -> None:
         """
