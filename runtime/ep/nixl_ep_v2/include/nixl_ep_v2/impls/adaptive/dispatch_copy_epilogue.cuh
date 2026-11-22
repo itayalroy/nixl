@@ -38,6 +38,7 @@ template <bool kDoExpand, bool kDoZeroPadding, bool kZeroCopy,
           int kNumSMs, int kNumChannelsPerSM, int kNumWarps,
           int kNumHiddenBytes, int kNumSFPacks,
           int kNumExpertsPerRank, int kNumTopk, int kExpertAlignment,
+          bool kExpectNoRecv = false,
           int kNumThreads = kNumWarps * 32>
 __global__ void __launch_bounds__(kNumThreads, 1)
 dispatch_copy_epilogue_impl(void* buffer, void* workspace,
@@ -52,6 +53,7 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
                             const int recv_sf_token_stride, const int recv_sf_hidden_stride,
                             const topology::EPTopology* topology_ptr,
                             const int num_max_tokens_per_rank) {
+    EP_STATIC_ASSERT(not kExpectNoRecv or not kZeroCopy, "expect_no_recv does not use a zero-copy arena");
     // Topology
     const auto topo = topology::load(topology_ptr);
     const int num_scaleout_ranks = topo.num_scaleout_ranks, num_scaleup_ranks = topo.num_scaleup_ranks;
@@ -103,6 +105,8 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
     // For no CPU sync case, the number of received tokens should be read from the GPU tensor
     if (num_recv_tokens < 0)
         num_recv_tokens = psum_num_recv_tokens_per_scaleup_rank[num_max_scaleup_ranks];
+    if constexpr (kExpectNoRecv)
+        EP_DEVICE_ASSERT(num_recv_tokens == 0 and "expect_no_recv received expert rows");
 
     // Current rank indices should be maintained
     int current_rank_idx = -1, stored_psum_num_recv_tokens;

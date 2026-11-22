@@ -59,6 +59,7 @@ class ElasticBuffer {
 
     // CUDA streams
     at::cuda::CUDAStream comm_stream;
+    const bool expect_no_recv;
 
     // Whether to allow multiple reductions
     bool allow_multiple_reduction;
@@ -124,10 +125,13 @@ public:
                   const int& num_nixl_channels, const std::string& agent_name_prefix,
                   const int& num_experts_per_rank,
                   const int64_t& num_zero_copy_bytes,
-                  const int& dynamic_take_mode):
+                  const int& dynamic_take_mode,
+                  const bool& per_buffer_comm_stream = false,
+                  const bool& expect_no_recv = false):
         num_buffer_bytes(num_buffer_bytes),
         explicitly_destroy(explicitly_destroy),
-        comm_stream(get_global_comm_stream()),
+        comm_stream(per_buffer_comm_stream ? at::cuda::getStreamFromPool(true) : get_global_comm_stream()),
+        expect_no_recv(expect_no_recv),
         allow_multiple_reduction(allow_multiple_reduction),
         prefer_overlap_with_compute(prefer_overlap_with_compute),
         dynamic_take_mode(dynamic_take_mode),
@@ -137,6 +141,8 @@ public:
         EP_HOST_ASSERT(num_buffer_bytes > 0 and num_buffer_bytes % kNumAlignmentBytes == 0);
         EP_HOST_ASSERT(0 <= dynamic_take_mode and dynamic_take_mode <= 2 and "dynamic_take_mode: 0 off, 1 on, 2 automatic");
         EP_HOST_ASSERT(num_zero_copy_bytes >= 0 and num_zero_copy_bytes % kNumAlignmentBytes == 0 and "The zero-copy arena is a whole number of 2 MB units");
+        EP_HOST_ASSERT((not expect_no_recv or num_zero_copy_bytes == 0) and
+                       "expect_no_recv does not use a zero-copy arena");
 
         // Fixed expert slots per rank (0: a buffer that never dispatches); the slots of the declared maximum world
         // must fit the workspace's expert capacity
@@ -917,9 +923,12 @@ public:
             topo.num_scaleout_ranks,
             topo.num_scaleup_ranks,
             num_experts);
-        std::fill_n(host_workspace_layout.get_scaleup_rank_count_ptr<false>(), topo.num_scaleup_ranks, 0);
-        std::fill_n(host_workspace_layout.get_scaleup_expert_count_ptr<false>(), num_local_experts, 0);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
+        // Known-empty receivers neither publish nor consume mapped receive counts.
+        if (not expect_no_recv) {
+            std::fill_n(host_workspace_layout.get_scaleup_rank_count_ptr<false>(), topo.num_scaleup_ranks, 0);
+            std::fill_n(host_workspace_layout.get_scaleup_expert_count_ptr<false>(), num_local_experts, 0);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+        }
 
         uint8_t* zc_slot_base = nullptr;
         void* zc_recv_x_ptr = nullptr;
@@ -961,7 +970,7 @@ public:
                         num_channels_per_sm,
                         num_smem_bytes,
                         num_gpu_timeout_cycles,
-                        do_cpu_sync,
+                        do_cpu_sync and not expect_no_recv,
                         zero_copy,
                         zc_recv_x_ptr, zc_recv_sf_ptr, zc_recv_topk_idx_ptr, zc_recv_topk_weights_ptr,
                         zc_recv_src_metadata_ptr,
@@ -977,7 +986,10 @@ public:
         std::vector<int> num_recv_tokens_per_expert_list;
 
         // Assign these values according to modes
-        if (do_cpu_sync) {
+        if (expect_no_recv) {
+            if (do_cpu_sync)
+                num_recv_tokens_per_expert_list.resize(num_local_experts, 0);
+        } else if (do_cpu_sync) {
             // With CPU sync, the exact counts
             const auto start_cpu_time = std::chrono::high_resolution_clock::now();
             while (true) {
@@ -1121,7 +1133,8 @@ public:
                                       recv_src_metadata.data_ptr<int>(),
                                       channel_linked_list_ptr,
                                       num_unaligned_recv_tokens_per_expert_ptr,
-                                      do_cpu_sync ? num_recv_tokens : -1, max_num_scaleup_ranks, num_max_tokens_per_rank,
+                                      expect_no_recv or not do_cpu_sync ? -1 : num_recv_tokens,
+                                      max_num_scaleup_ranks, num_max_tokens_per_rank,
                                       num_hidden_bytes,
                                       num_sf_packs, recv_sf_token_stride, recv_sf_hidden_stride,
                                       num_experts_per_rank, num_topk, expert_alignment,
@@ -1130,7 +1143,7 @@ public:
                                       jit::device_runtime->get_num_smem_bytes(),
                                       num_channels_per_sm,
                                       do_expand, do_zero_padding, zero_copy,
-                                      comm_stream);
+                                      comm_stream, expect_no_recv);
 
         // Stream control
         const auto event = stream_control_epilogue(
@@ -1210,6 +1223,8 @@ public:
         EP_HOST_ASSERT(num_topk_p2 == num_topk + 2);
         EP_HOST_ASSERT(src_metadata.is_cuda() and src_metadata.is_contiguous());
         EP_HOST_ASSERT(src_metadata.scalar_type() == torch::kInt);
+        EP_HOST_ASSERT((not expect_no_recv or (num_tokens == 0 and num_reduced_tokens == 0)) and
+                       "expect_no_recv combines with zero local expert rows and metadata");
 
         // Check optional tensors
         if (topk_weights.has_value()) {
@@ -1346,6 +1361,7 @@ static void register_apis(pybind11::module_& m) {
 
     pybind11::class_<ElasticBuffer>(m, "ElasticBuffer")
         .def(pybind11::init<int64_t, bool, bool, int, int, bool, int, int, int, int, int, std::string, int, int64_t, int>())
+        .def(pybind11::init<int64_t, bool, bool, int, int, bool, int, int, int, int, int, std::string, int, int64_t, int, bool, bool>())
         .def("destroy", &ElasticBuffer::destroy)
         .def("get_comm_stream", &ElasticBuffer::get_comm_stream)
         .def("get_physical_domain_size", &ElasticBuffer::get_physical_domain_size)

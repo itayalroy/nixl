@@ -45,6 +45,7 @@ static void __instantiate_kernels() {
     auto p3 = reinterpret_cast<void*>(&adaptive_combine_impl<true, false, 26, 7, 4, 8, 7168, 8, 8, 2000000000ll>);
     auto p4 = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<false, false, false, 148, 7, 16, 14336, 0, 8, 8, 1>);
     auto p5 = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<true, true, false, 148, 7, 16, 14336, 0, 8, 8, 32>);
+    auto pe = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<true, true, false, 148, 7, 16, 14336, 0, 8, 8, 32, true>);
     auto p6 = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<false, true, 148, 16, 7, 64, 7168, 8, 8, 2000000000ll>);
     auto p7 = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<true, false, 148, 16, 7, 64, 7168, 8, 8, 2000000000ll>);
     auto p8 = reinterpret_cast<void*>(&adaptive_dispatch_impl<false, false, 26, 4, 7, 32, 128, 14336, 0, 1, 8, 1, 2000000000ll>);
@@ -89,7 +90,7 @@ static void __instantiate_kernels() {
     auto z7 = reinterpret_cast<void*>(&adaptive_dispatch_impl<false, true, 26, 4, 7, 2, 4, 14336, 0, 32, 8, 1, 2000000000ll>);
     auto z8 = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<false, false, true, 148, 7, 16, 14336, 0, 8, 8, 1>);
     (void) pb; (void) p0; (void) p1; (void) pf; (void) p2; (void) p3; (void) p4; (void) p5; (void) p6; (void) p7; (void) p8; (void) p9; (void) pw; (void) q0; (void) q1; (void) q2; (void) q3; (void) q4; (void) q5;
-    (void) pg; (void) ph; (void) pn0; (void) pn1; (void) pn2; (void) pn3; (void) pn4; (void) pn5; (void) pn6; (void) pn7; (void) pn8;
+    (void) pe; (void) pg; (void) ph; (void) pn0; (void) pn1; (void) pn2; (void) pn3; (void) pn4; (void) pn5; (void) pn6; (void) pn7; (void) pn8;
     // Zero copy on the NVFP4 wire: the 1 x 16 perf shape at 4 channels per SM (the tests' 4-channel block) and at 8 (this wire's count
     // under `prefer_overlap_with_compute`), each with its 32-warp compact copy epilogue
     auto zn0 = reinterpret_cast<void*>(&adaptive_dispatch_impl<false, true, 26, 4, 4, 1, 16, 3584, 112, 16, 8, 1, 2000000000ll>);

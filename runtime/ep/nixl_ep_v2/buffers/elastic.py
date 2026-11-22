@@ -348,6 +348,8 @@ class ElasticBuffer:
         zc_use_fp8_dispatch: bool = False,
         zc_use_nvfp4_dispatch: bool = False,
         dynamic_take: Optional[bool] = False,
+        per_buffer_comm_stream: bool = False,
+        expect_no_recv: bool = False,
     ):
         """
         Initialize the elastic communication buffer.
@@ -412,7 +414,19 @@ class ElasticBuffer:
                 at every batch size and active SM count on 1x16, where the static shares meet the per-SM egress arbitration
                 tiers); `None` = automatic, on in direct mode. The hybrid paths' division is pinned by the notify count protocol
                 and ignores the setting. `NIXL_EP_DYNAMIC_TAKE` (`auto`, `1`, `0`) overrides the argument for A/B runs.
+            per_buffer_comm_stream: take a communication stream from the CUDA stream pool for this buffer instead of
+                sharing the global stream. Use separate streams to overlap independent buffers.
+            expect_no_recv: this rank never receives expert rows. Dispatch returns zero-row receive tensors and combine
+                accepts zero local expert rows. The GPU checks the receive count on every dispatch, including graph replay.
+                This is fixed for the buffer's lifetime, preserves peer participation, and excludes a zero-copy arena.
         """
+        assert isinstance(per_buffer_comm_stream, bool)
+        assert isinstance(expect_no_recv, bool)
+        assert (
+            not expect_no_recv or num_zero_copy_slots == 0
+        ), "expect_no_recv does not use a zero-copy arena"
+        self.per_buffer_comm_stream = per_buffer_comm_stream
+        self.expect_no_recv = expect_no_recv
         assert num_zero_copy_slots >= 0, "num_zero_copy_slots must not be negative"
         if num_zero_copy_slots > 0:
             assert (
@@ -595,6 +609,8 @@ class ElasticBuffer:
             num_experts_per_rank,
             num_zero_copy_bytes,
             dynamic_take_mode,
+            per_buffer_comm_stream,
+            expect_no_recv,
         )
 
         if num_zero_copy_slots > 0:

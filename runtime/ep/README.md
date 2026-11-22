@@ -67,6 +67,19 @@ release.
   direct when exactly one NVLink domain is live, hybrid otherwise.
 - `set_num_active_sms(...)`: Change the active SM count of the live world.
 
+Use `ElasticBuffer(..., per_buffer_comm_stream=True)` to give independent
+buffers separate CUDA pool streams. Each buffer still orders its communication
+with the caller's current stream through events.
+
+A rank that originates tokens but never owns a selected expert can set
+`expect_no_recv=True` at construction. Dispatch then returns zero-row receive
+tensors, including without CPU count synchronization, and combine takes a
+`[0, hidden]` BF16 input. The rank still participates in the full peer protocol
+and hybrid forwarding; the GPU checks that it received no expert rows on every
+dispatch, including graph replay. Routes must exclude this rank's expert slots.
+This option does not use a zero-copy arena and does not reduce registered
+transport capacity.
+
 ## Requirements
 
 NIXL-EP V2 requires CUDA tools (`nvcc` and `cuobjdump`), PyTorch, a UCX build
