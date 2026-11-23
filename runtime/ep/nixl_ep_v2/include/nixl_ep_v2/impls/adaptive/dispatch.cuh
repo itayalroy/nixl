@@ -388,10 +388,14 @@ adaptive_dispatch_impl(
         int *rank_count = rank_expert_count, *expert_count = rank_expert_count + num_ranks;
         int* channel_count = rank_expert_count + num_ranks + num_experts;   // `[channel][domain]`, hybrid only
         const int num_reduction_entries = num_ranks + num_experts + (is_direct ? 0 : num_channels * num_scaleout_ranks);
-        #pragma unroll
-        for (int i = 0; i < kNumAlignedElems / kNumNotifyThreads; ++ i)
-            rank_expert_count[i * kNumNotifyThreads + thread_idx] = 0;
-        ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+        // A direct FFN has no outgoing counts. Its polling loop writes every incoming
+        // slot, including zeros for inactive sources, before the local prefix sums.
+        if (not receive_only) {
+            #pragma unroll
+            for (int i = 0; i < kNumAlignedElems / kNumNotifyThreads; ++ i)
+                rank_expert_count[i * kNumNotifyThreads + thread_idx] = 0;
+            ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+        }
 
         // Atomic add on shared memory
         // Zero copy: the whole block counts (the data warps join from their branch)
@@ -400,7 +404,7 @@ adaptive_dispatch_impl(
             for (int i = sm_idx * kNumWarps + warp_idx; i < num_tokens; i += kNumWarps * num_active_sms)
                 count_token(i, rank_count, expert_count);
             ptx::named_barrier<kNumThreads>(kCountBarrierIndex);
-        } else {
+        } else if (not receive_only) {
             EP_STATIC_ASSERT(kNumTopk <= 32, "Insufficient lanes");
             const auto global_warp_idx = sm_idx * kNumNotifyWarps + warp_idx;
             // SM-major token order (`num_contributors` below relies on it)
@@ -429,7 +433,8 @@ adaptive_dispatch_impl(
                 }
             }
         }
-        ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+        if (not receive_only)
+            ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
         EP_PROFILE_STAMP(workspace_layout, 8);
 
         // Do full-grid reduction
@@ -448,12 +453,18 @@ adaptive_dispatch_impl(
 
         // Do the remaining work by SM 0
         if (sm_idx == 0) {
+            const int first_source_rank = receive_only ?
+                scaleout_rank_idx * num_scaleup_ranks + min(num_scaleup_ranks, direct_roles.ffn_end) : 0;
+            const int end_source_rank = receive_only ? (scaleout_rank_idx + 1) * num_scaleup_ranks : num_ranks;
+            const int first_source_expert = first_source_rank * num_experts_per_rank;
+            const int num_source_experts = (end_source_rank - first_source_rank) * num_experts_per_rank;
+
             // Reduce all SM's count
             // Wait all contributing SMs' arrival (every ACTIVE SM unless the direct partition leaves some without tokens)
-            if (local_reduce) {
+            if (local_reduce and not receive_only) {
                 for (int i = thread_idx; i < num_reduction_entries; i += kNumNotifyThreads)
                     rank_expert_count[i] = math::encode_decode_positive<int>(rank_expert_count[i]);
-            } else {
+            } else if (not local_reduce) {
                 for (int i = thread_idx; i < num_reduction_entries; i += kNumNotifyThreads) {
                     comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
                         const auto status = ptx::ld_volatile<int64_t>(workspace_layout.get_notify_reduction_workspace_ptr() + i);
@@ -499,7 +510,8 @@ adaptive_dispatch_impl(
             }
             if (zc)
                 ptx::tma_store_fence();
-            ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+            if (not receive_only)
+                ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
             EP_PROFILE_STAMP(workspace_layout, 2);
 
             if (is_direct) {
@@ -553,7 +565,7 @@ adaptive_dispatch_impl(
                     const auto acquire_ready = [&](const int& pos) {
                         comm::peer_ready_acquire_rt<kNumTimeoutCycles, comm::kDirectDispatchTag, kNumMaxScaleupRanks>(acquired_ready, workspace_layout, topo, pos);
                     };
-                    for (int i = thread_idx; i < num_scaleup_ranks; i += kNumNotifyThreads) {
+                    for (int i = thread_idx; not receive_only and i < num_scaleup_ranks; i += kNumNotifyThreads) {
                         if (not topology::is_scaleup_live<kNumMaxScaleupRanks>(topo, i) or not direct_roles.sends_to(i))
                             continue;
                         acquire_ready(i);
@@ -561,7 +573,8 @@ adaptive_dispatch_impl(
                         const auto count = rank_count[scaleout_rank_idx * num_scaleup_ranks + i];   // the count of our domain's rank at position `i`
                         transport.put_value<int64_t>(dst_rank_counter, static_cast<int64_t>(count), scaleup_peer_id(i));
                     }
-                    __syncwarp();
+                    if (not receive_only)
+                        __syncwarp();
 
                     // Issue scaleup expert count writes to peers
                     if constexpr (kNumExpertsPerRank % 2 == 0) {
@@ -569,7 +582,7 @@ adaptive_dispatch_impl(
                         // slot array is 16-byte aligned) per vector store; a pair never straddles two ranks. The receiver polls each
                         // element on its own, so only the per-element values matter (the high word is the sign extension).
                         // The storing lane acquires its destination's READY itself (`acquire_ready`)
-                        for (int j = thread_idx; j < num_experts / 2; j += kNumNotifyThreads) {
+                        for (int j = thread_idx; not receive_only and j < num_experts / 2; j += kNumNotifyThreads) {
                             const int i = j * 2;
                             const auto dst_rank = i / num_experts_per_rank;
                             if (not is_rank_live(dst_rank) or not direct_roles.sends_to(position_of(dst_rank)))
@@ -581,7 +594,7 @@ adaptive_dispatch_impl(
                                                 make_int4(v0, v0 >> 31, v1, v1 >> 31), scaleup_peer_id(position_of(dst_rank)));
                         }
                     } else {
-                        for (int i = thread_idx; i < num_experts; i += kNumNotifyThreads) {
+                        for (int i = thread_idx; not receive_only and i < num_experts; i += kNumNotifyThreads) {
                             const auto dst_rank = i / num_experts_per_rank;
                             if (not is_rank_live(dst_rank) or not direct_roles.sends_to(position_of(dst_rank)))
                                 continue;
@@ -594,7 +607,8 @@ adaptive_dispatch_impl(
                     }
 
                     // This is necessary, as the waited results will rewrite the shared memory
-                    ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+                    if (not receive_only)
+                        ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
                     EP_PROFILE_STAMP(workspace_layout, 3);
 
                     // Our outgoing stores (data and counts) are complete once the block's end sequence arrives: SM 0's notify warps
@@ -616,10 +630,10 @@ adaptive_dispatch_impl(
                     } else if constexpr (kNumExpertsPerRank % 2 == 0) {
                         // Polled in 16-byte chunks of two 64-bit slots: every element is checked on its own (a chunk is retried until
                         // all its live elements read as written; a vector load need not be atomic), then the chunk is zeroed for the next call
-                        const int num_rank_chunks = (num_scaleup_ranks + 1) / 2, num_expert_chunks = num_experts / 2;
+                        const int num_rank_chunks = (num_scaleup_ranks + 1) / 2, num_expert_chunks = num_source_experts / 2;
                         for (int c = thread_idx; c < num_rank_chunks + num_expert_chunks; c += kNumNotifyThreads) {
                             const bool is_rank_chunk = c < num_rank_chunks;
-                            const int e0 = is_rank_chunk ? c * 2 : (c - num_rank_chunks) * 2;
+                            const int e0 = is_rank_chunk ? c * 2 : first_source_expert + (c - num_rank_chunks) * 2;
                             int64_t* chunk_ptr = is_rank_chunk ? workspace_layout.get_scaleup_rank_count_ptr<false>() + e0
                                                                : workspace_layout.get_scaleup_expert_count_ptr<false>() + e0;
                             // Element liveness (a rank chunk's second element may lie past the live positions)
@@ -659,9 +673,9 @@ adaptive_dispatch_impl(
                                     smem_dst[k] = live[k] ? decoded[k] : 0;
                         }
                     } else {
-                        for (int i = thread_idx; i < num_scaleup_ranks + num_experts; i += kNumNotifyThreads) {
+                        for (int i = thread_idx; i < num_scaleup_ranks + num_source_experts; i += kNumNotifyThreads) {
                             const bool is_rank_slot = i < num_scaleup_ranks;
-                            const int expert_slot = i - num_scaleup_ranks;
+                            const int expert_slot = first_source_expert + i - num_scaleup_ranks;
                             const bool live = is_rank_slot ? receives_count_from(i)
                                                            : (is_rank_live(expert_slot / num_experts_per_rank) and
                                                               direct_roles.receives_from(position_of(expert_slot / num_experts_per_rank)));
@@ -670,7 +684,8 @@ adaptive_dispatch_impl(
                                 *smem_dst = 0;
                                 continue;
                             }
-                            const auto slot_ptr = workspace_layout.get_scaleup_count_ptr<false>(i, num_scaleup_ranks);
+                            const auto slot_ptr = workspace_layout.get_scaleup_count_ptr<false>(
+                                is_rank_slot ? i : num_scaleup_ranks + expert_slot, num_scaleup_ranks);
                             comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
                                 // NOTES: the global memory type has 64 bits
                                 const auto count = static_cast<int>(ptx::ld_volatile<int64_t>(slot_ptr));
@@ -695,7 +710,7 @@ adaptive_dispatch_impl(
                 for (int i = thread_idx; i < num_experts_per_rank; i += kNumNotifyThreads) {
                     int sum = 0;
                     if (not zero_local_receive_counts)
-                        for (int j = 0; j < num_ranks; ++ j)
+                        for (int j = first_source_rank; j < end_source_rank; ++ j)
                             sum += expert_count[j * num_experts_per_rank + i];
 
                     // Write unaligned count before aligning
