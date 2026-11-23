@@ -839,10 +839,8 @@ public:
 
         // The prefix sum tensor of number of received tokens from each rank
         // Will also be used in combine as the dispatch handle
-        // `[max_num_scaleup_ranks + 1]`: the total goes into the fixed last slot; zeroed on the communication stream, which the kernel follows
+        // The notify warp writes the live prefix, clears the unused positions and writes the total in the last slot.
         auto psum_num_recv_tokens_per_scaleup_rank = torch::empty({max_num_scaleup_ranks + 1}, int_options);
-        CUDA_RUNTIME_CHECK(cudaMemsetAsync(psum_num_recv_tokens_per_scaleup_rank.data_ptr(), 0,
-                                           psum_num_recv_tokens_per_scaleup_rank.nbytes(), comm_stream));
 
         // Decide number of channels by shared memory consumption
         const int num_smem_bytes = jit::device_runtime->get_num_smem_bytes();
@@ -1319,24 +1317,26 @@ public:
         // Combine pushed data: the reduce epilogue derives the rows to reduce from the topology descriptor
         // (`EPTopology`, its `mode` and rank counts) and takes the buffer base
         stream_control_before_epilogue(previous_event_before_epilogue);
-        launch_combine_reduce_epilogue(combined_x.data_ptr(),
-                                       combined_topk_weights_ptr,
-                                       combined_topk_idx.data_ptr<topk_idx_t>(),
-                                       token_result_imm_completions.data_ptr<uint8_t>(),
-                                       num_combined_tokens, num_max_tokens_per_rank,
-                                       hidden,
-                                       num_experts_per_rank, num_topk,
-                                       num_gpu_timeout_cycles,
-                                       buffer, workspace,
-                                       bias_ptrs[0], bias_ptrs[1],
-                                       get_topology_ptr(),
-                                       max_num_scaleup_ranks,
-                                       jit::device_runtime->get_num_sms(),
-                                       jit::device_runtime->get_num_smem_bytes(),
-                                       *adaptive_num_channels_per_sm,
-                                       nixl_context->num_channels,
-                                       use_expanded_layout, allow_multiple_reduction,
-                                       comm_stream);
+        // With no local source rows, the reduction has no results or receive completions to consume.
+        if (num_combined_tokens > 0)
+            launch_combine_reduce_epilogue(combined_x.data_ptr(),
+                                           combined_topk_weights_ptr,
+                                           combined_topk_idx.data_ptr<topk_idx_t>(),
+                                           token_result_imm_completions.data_ptr<uint8_t>(),
+                                           num_combined_tokens, num_max_tokens_per_rank,
+                                           hidden,
+                                           num_experts_per_rank, num_topk,
+                                           num_gpu_timeout_cycles,
+                                           buffer, workspace,
+                                           bias_ptrs[0], bias_ptrs[1],
+                                           get_topology_ptr(),
+                                           max_num_scaleup_ranks,
+                                           jit::device_runtime->get_num_sms(),
+                                           jit::device_runtime->get_num_smem_bytes(),
+                                           *adaptive_num_channels_per_sm,
+                                           nixl_context->num_channels,
+                                           use_expanded_layout, allow_multiple_reduction,
+                                           comm_stream);
 
         // Stream control
         const auto event = stream_control_epilogue(

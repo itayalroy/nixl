@@ -59,6 +59,7 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
     const int num_scaleout_ranks = topo.num_scaleout_ranks, num_scaleup_ranks = topo.num_scaleup_ranks;
     const int scaleout_rank_idx = topo.scaleout_rank_idx, scaleup_rank_idx = topo.scaleup_rank_idx;
     const int num_ranks = num_scaleout_ranks * num_scaleup_ranks;
+    const int num_experts = num_ranks * kNumExpertsPerRank;
     const int num_channels = kNumChannelsPerSM * topo.num_active_sms;
     // Direct mode has no forwarding stage, hence no linked list to build
     const bool do_create_linked_list = topo.mode == topology::kModeHybrid;
@@ -68,9 +69,45 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
     const auto global_warp_idx = comm::cross_sm_warp_idx(sm_idx, warp_idx, kNumSMs);
 
+    const auto finish_forwarding_lists = [&] {
+        if (not do_create_linked_list)
+            return;
+        const auto workspace_layout = layout::WorkspaceLayout(workspace, num_scaleout_ranks, num_scaleup_ranks, num_experts);
+        const int list_capacity = num_scaleout_ranks * math::ceil_div(num_max_tokens_per_rank, num_channels);
+        for (int i = global_warp_idx; i < num_channels; i += kNumSMs * kNumWarps) {
+            for (int k = lane_idx; k < num_scaleup_ranks; k += 32) {
+                // Masked positions never published a tail.
+                if (not topo.is_scaleup_live(k))
+                    continue;
+                const int tail_idx = *workspace_layout.get_channel_scaleup_tail_ptr(i, k);
+                const int list_base = i * (list_capacity + 1) * num_scaleup_ranks + k;
+                const int list_length = (tail_idx - list_base) / num_scaleup_ranks;
+                channel_linked_list[tail_idx] = -1;
+                // Negative lengths distinguish this metadata from token indices, including for empty lists.
+                channel_linked_list[list_base + list_capacity * num_scaleup_ranks] = -list_length - 1;
+                *workspace_layout.get_channel_scaleup_tail_ptr(i, k) = 0;
+            }
+            __syncwarp();
+        }
+    };
+
+#ifdef EP_ADAPTIVE_PROFILE
+    const auto profile_layout = layout::WorkspaceLayout(workspace, num_scaleout_ranks, num_scaleup_ranks, num_experts);
+#endif
+    if constexpr (kExpectNoRecv) {
+        // Forwarding metadata is still needed by hybrid combine on a source-only rank.
+        cudaGridDependencySynchronize();
+        EP_PROFILE_STAMP(profile_layout, 12);
+        if (thread_idx == 0)
+            EP_DEVICE_ASSERT(psum_num_recv_tokens_per_scaleup_rank[num_max_scaleup_ranks] == 0 and
+                             "expect_no_recv received expert rows");
+        finish_forwarding_lists();
+        EP_PROFILE_STAMP_LAST(profile_layout, 13);
+        return;
+    }
+
     // For top-k index transformations (fixed expert slots per rank: the live expert count follows the live rank count)
     const int num_experts_per_rank = kNumExpertsPerRank;
-    const int num_experts = num_ranks * kNumExpertsPerRank;
     const auto rank_idx = scaleout_rank_idx * num_scaleup_ranks + scaleup_rank_idx;
     const auto expert_start_idx = num_experts_per_rank * rank_idx, expert_end_idx = num_experts_per_rank * (rank_idx + 1);
 
@@ -97,16 +134,11 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
     }
 
     // Profile slots 12/13: epilogue work start (block 0) / last block done
-#ifdef EP_ADAPTIVE_PROFILE
-    const auto profile_layout = layout::WorkspaceLayout(workspace, num_scaleout_ranks, num_scaleup_ranks, num_experts);
     EP_PROFILE_STAMP(profile_layout, 12);
-#endif
 
     // For no CPU sync case, the number of received tokens should be read from the GPU tensor
     if (num_recv_tokens < 0)
         num_recv_tokens = psum_num_recv_tokens_per_scaleup_rank[num_max_scaleup_ranks];
-    if constexpr (kExpectNoRecv)
-        EP_DEVICE_ASSERT(num_recv_tokens == 0 and "expect_no_recv received expert rows");
 
     // Current rank indices should be maintained
     int current_rank_idx = -1, stored_psum_num_recv_tokens;
@@ -240,31 +272,7 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         __syncwarp();
     }
 
-    // Maintain linked list's ending
-    // Or you can understand it as writing the tail at once
-    // Live positions only: a masked position never published a tail (its word is zero and would alias channel 0's first entry)
-    if (do_create_linked_list) {
-        const auto workspace_layout = layout::WorkspaceLayout(workspace, num_scaleout_ranks, num_scaleup_ranks, num_experts);
-        const int list_capacity = num_scaleout_ranks * math::ceil_div(num_max_tokens_per_rank, num_channels);
-        for (int i = global_warp_idx; i < num_channels; i += kNumSMs * kNumWarps) {
-            for (int k = lane_idx; k < num_scaleup_ranks; k += 32) {
-                if (not topo.is_scaleup_live(k))
-                    continue;
-                const int tail_idx = *workspace_layout.get_channel_scaleup_tail_ptr(i, k);
-                const int list_base = i * (list_capacity + 1) * num_scaleup_ranks + k;
-                const int list_length = (tail_idx - list_base) / num_scaleup_ranks;
-                channel_linked_list[tail_idx] = -1;
-                // Store the length as -(length + 1), so sorting distinguishes list-end metadata from token indices.
-                // The +1 keeps empty lists negative; the reader accounts for it with last_index = -stored_value - 2.
-                // A full list uses this entry as its end marker.
-                channel_linked_list[list_base + list_capacity * num_scaleup_ranks] = -list_length - 1;
-
-                // Clean for combine usages
-                *workspace_layout.get_channel_scaleup_tail_ptr(i, k) = 0;
-            }
-            __syncwarp();
-        }
-    }
+    finish_forwarding_lists();
 
     // Zero padding: clear the alignment gaps between experts in the expanded output
     if constexpr (kDoZeroPadding and kDoExpand) {

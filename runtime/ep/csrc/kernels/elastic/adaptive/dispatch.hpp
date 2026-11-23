@@ -319,8 +319,12 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
     // A margin below the opt-in maximum: a layout that filled it to the byte faulted on the last warp's mbarrier
     constexpr int kNumSmemReserveBytes = 1024;
     const auto token_layout = layout::TokenLayout(num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
-    const auto num_warps = std::min((num_smem_bytes - kNumSmemReserveBytes) / token_layout.get_num_bytes<true>(), 32);
+    // Source-only ranks validate the count and close hybrid forwarding lists without any staging memory.
+    const auto num_warps = expect_no_recv ? 4 :
+        std::min((num_smem_bytes - kNumSmemReserveBytes) / token_layout.get_num_bytes<true>(), 32);
     const auto num_threads = num_warps * 32;
+    const auto num_blocks = expect_no_recv ? std::min(4, num_sms) : num_sms;
+    const auto launch_smem_bytes = expect_no_recv ? 0 : num_smem_bytes;
 
     // Generate, build and launch
     const DispatchCopyEpilogueRuntime::Args args = {
@@ -341,7 +345,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
         .recv_sf_token_stride = recv_sf_token_stride, .recv_sf_hidden_stride = recv_sf_hidden_stride,
         .topology = topology,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
-        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, true)};
+        .launch_args = jit::LaunchArgs(num_blocks, num_threads, launch_smem_bytes, 1, false, true)};
     const auto code = DispatchCopyEpilogueRuntime::generate(args);
     const auto runtime = jit::compiler->build("adaptive_dispatch_copy_epilogue", code);
     DispatchCopyEpilogueRuntime::launch(runtime, args, stream);

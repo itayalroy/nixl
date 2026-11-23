@@ -852,6 +852,8 @@ adaptive_dispatch_impl(
                 // Inclusive prefix sum
                 // The total goes into the fixed slot `[kNumMaxScaleupRanks]`, which the epilogue and the combine read under any live world
                 const auto total = do_psum(rank_count, psum_num_recv_tokens_per_scaleup_rank, num_scaleup_ranks, 0);
+                for (int i = num_scaleup_ranks + lane_idx; i < kNumMaxScaleupRanks; i += 32)
+                    psum_num_recv_tokens_per_scaleup_rank[i] = 0;
                 if (lane_idx == 0)
                     psum_num_recv_tokens_per_scaleup_rank[kNumMaxScaleupRanks] = total;
             } else if (warp_idx == 1) {
