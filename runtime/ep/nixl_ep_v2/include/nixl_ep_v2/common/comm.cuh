@@ -115,6 +115,19 @@ __device__ __forceinline__ int cross_sm_warp_idx(const int sm_idx, const int war
     return warp_in_sm_idx * num_sms + sm_idx;
 }
 
+__device__ __forceinline__ void finish_channel_linked_list(const layout::WorkspaceLayout& workspace,
+                                                            int* channel_linked_list, int channel, int peer,
+                                                            int num_scaleup_ranks, int list_capacity) {
+    const auto tail_ptr = workspace.get_channel_scaleup_tail_ptr(channel, peer);
+    const int tail_idx = *tail_ptr;
+    const int list_base = channel * (list_capacity + 1) * num_scaleup_ranks + peer;
+    const int list_length = (tail_idx - list_base) / num_scaleup_ranks;
+    channel_linked_list[tail_idx] = -1;
+    // Negative lengths distinguish this metadata from token indices, including for empty lists.
+    channel_linked_list[list_base + list_capacity * num_scaleup_ranks] = -list_length - 1;
+    *tail_ptr = 0;
+}
+
 __device__ __forceinline__ int get_nixl_notify_channel_idx() {
     return 0;
 }

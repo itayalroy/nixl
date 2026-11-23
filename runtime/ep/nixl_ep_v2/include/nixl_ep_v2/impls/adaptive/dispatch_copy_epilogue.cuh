@@ -79,13 +79,7 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
                 // Masked positions never published a tail.
                 if (not topo.is_scaleup_live(k))
                     continue;
-                const int tail_idx = *workspace_layout.get_channel_scaleup_tail_ptr(i, k);
-                const int list_base = i * (list_capacity + 1) * num_scaleup_ranks + k;
-                const int list_length = (tail_idx - list_base) / num_scaleup_ranks;
-                channel_linked_list[tail_idx] = -1;
-                // Negative lengths distinguish this metadata from token indices, including for empty lists.
-                channel_linked_list[list_base + list_capacity * num_scaleup_ranks] = -list_length - 1;
-                *workspace_layout.get_channel_scaleup_tail_ptr(i, k) = 0;
+                comm::finish_channel_linked_list(workspace_layout, channel_linked_list, i, k, num_scaleup_ranks, list_capacity);
             }
             __syncwarp();
         }

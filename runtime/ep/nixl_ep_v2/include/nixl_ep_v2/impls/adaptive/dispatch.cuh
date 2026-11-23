@@ -75,7 +75,8 @@ adaptive_dispatch_impl(
     int* zc_count_matrix, const int zc_count_row_stride, const int zc_count_matrix_rows,
     const int zc_slot_idx,
     const bool dynamic_take,
-    const int num_max_tokens_per_rank) {
+    const int num_max_tokens_per_rank,
+    int* source_only_channel_linked_list) {
     EP_STATIC_ASSERT(kNumNotifyWarps % 4 == 0, "Invalid warpgroup size");
     EP_STATIC_ASSERT(kNumMaxScaleoutRanks <= topology::kNumMaxScaleoutRanksCap, "Too many scale-out ranks");
     EP_STATIC_ASSERT(kNumMaxScaleupRanks <= topology::kNumMaxScaleupRanksCap, "Too many scale-up ranks");
@@ -1560,6 +1561,25 @@ adaptive_dispatch_impl(
     comm::gpu_barrier_rt<kNumThreads, kNumTimeoutCycles, comm::kHybridDispatchTag1, kNumMaxScaleupRanks, true, true, false>(
         transport, workspace_layout, topo, sm_idx, thread_idx, /* do not scale-out */ false, true);
     EP_PROFILE_STAMP(workspace_layout, 7);
+
+    if constexpr (kNumFFNRanks > 0 and kNumMaxScaleoutRanks == 1) {
+        if (source_only_channel_linked_list != nullptr) {
+            // A single declared domain can still force hybrid mode. Before finishing its handle's
+            // forwarding lists here, wait on SM 0's peer barrier as the separate copy launch would.
+            comm::active_grid_sync<kNumTimeoutCycles>(workspace_layout.get_active_grid_barrier_ptr(), num_active_sms);
+            if (sm_idx == 0 and thread_idx == 0)
+                EP_DEVICE_ASSERT(psum_num_recv_tokens_per_scaleup_rank[kNumMaxScaleupRanks] == 0 and
+                                 "expect_no_recv received expert rows");
+            if (warp_idx >= kNumNotifyWarps + kNumScaleoutWarps) {
+                const int channel = comm::cross_sm_warp_idx(sm_idx, warp_idx - kNumNotifyWarps - kNumScaleoutWarps, num_active_sms);
+                const int list_capacity = num_scaleout_ranks * num_max_tokens_per_channel;
+                for (int peer = lane_idx; peer < num_scaleup_ranks; peer += 32)
+                    if (topology::is_scaleup_live<kNumMaxScaleupRanks>(topo, peer))
+                        comm::finish_channel_linked_list(workspace_layout, source_only_channel_linked_list,
+                                                        channel, peer, num_scaleup_ranks, list_capacity);
+            }
+        }
+    }
 
     // MNNVL still uses ready-token counters, which must be reset before the next dispatch.
     // RDMA uses CQEs, which are handled separately.

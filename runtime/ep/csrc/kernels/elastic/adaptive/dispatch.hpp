@@ -68,6 +68,7 @@ public:
         int zc_count_row_stride, zc_count_matrix_rows, zc_slot_idx;
         bool dynamic_take;
         int num_max_tokens_per_rank;
+        int* source_only_channel_linked_list;
 
         jit::LaunchArgs launch_args;
     };
@@ -112,7 +113,8 @@ static void __instantiate_kernel() {{
             args.zc_count_matrix, args.zc_count_row_stride, args.zc_count_matrix_rows,
             args.zc_slot_idx,
             args.dynamic_take,
-            args.num_max_tokens_per_rank));
+            args.num_max_tokens_per_rank,
+            args.source_only_channel_linked_list));
     }
 };
 
@@ -185,6 +187,7 @@ static void launch_dispatch(void* x, void* sf,
                             int* zc_count_matrix, const int& zc_count_row_stride, const int& zc_count_matrix_rows,
                             const int& zc_slot_idx,
                             const bool& dynamic_take,
+                            int* source_only_channel_linked_list,
                             const at::cuda::CUDAStream& stream) {
     EP_HOST_ASSERT(num_max_scaleout_ranks <= kNumMaxScaleoutRanksCap and num_max_scaleup_ranks <= kNumMaxScaleupRanksCap);
     EP_HOST_ASSERT(1 <= num_channels_per_sm and num_channels_per_sm <= kNumMaxChannelsPerSM);
@@ -234,6 +237,7 @@ static void launch_dispatch(void* x, void* sf,
         .zc_count_row_stride = zc_count_row_stride, .zc_count_matrix_rows = zc_count_matrix_rows, .zc_slot_idx = zc_slot_idx,
         .dynamic_take = dynamic_take,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
+        .source_only_channel_linked_list = source_only_channel_linked_list,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
         .launch_args = jit::LaunchArgs(topology::get_num_launch_sms(), num_threads, num_smem_bytes, 2, true)};
     const auto code = DispatchRuntime::generate(args);
