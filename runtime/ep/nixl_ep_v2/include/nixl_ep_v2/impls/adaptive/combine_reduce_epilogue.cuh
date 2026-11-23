@@ -214,11 +214,12 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
             auto* bias_0_ptr = bias_0 == nullptr ? nullptr : static_cast<combine_vec_t*>(bias_0_buffer.get_token_buffer(token_idx).get_base_ptr());
             auto* bias_1_ptr = bias_1 == nullptr ? nullptr : static_cast<combine_vec_t*>(bias_1_buffer.get_token_buffer(token_idx).get_base_ptr());
             if (is_small_batch) {
-                // This item's 512-byte chunk, one vector per lane, every row load in flight before the row accumulation
+                // The warp owns its output chunk, so each lane can store its vector directly.
                 const int vec_offset = chunk_begin * kSmallBatchChunkVec;
+                auto* output = static_cast<combine_vec_t*>(output_buffer.get_token_buffer(token_idx).get_base_ptr());
                 combine_reduce<kSmallBatchChunkVec, 1, kNumTokensInLayout, true>(
-                    lane_idx, topk_slot_idx, dst_ptr + vec_offset,
-                    [=](const int& slot_idx) { return src_ptr(slot_idx) + vec_offset; }, wait_tma_buffer,
+                    lane_idx, topk_slot_idx, output + vec_offset,
+                    [=](const int& slot_idx) { return src_ptr(slot_idx) + vec_offset; }, [] {},
                     bias_0_ptr == nullptr ? nullptr : bias_0_ptr + vec_offset, bias_1_ptr == nullptr ? nullptr : bias_1_ptr + vec_offset);
                 return;
             }
@@ -242,6 +243,8 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
                 case 4: reduce_with.template operator()<(kNumTopk >= 4 ? 4 : kNumTopk)>(); break;
                 default: reduce_with.template operator()<kNumTopk>(); break;
             }
+        }
+        if (not is_weights_item and not is_small_batch) {
             ptx::tma_store_fence();
             __syncwarp();
 
