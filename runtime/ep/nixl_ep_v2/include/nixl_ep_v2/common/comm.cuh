@@ -351,6 +351,8 @@ __device__ __forceinline__ bool active_grid_arrive(unsigned* grid_barrier_ptr, c
     ptx::tma_store_commit();
     ptx::tma_store_wait();
     ptx::cta_barrier<kNumThreads>(kBarrierIndex);
+    if (num_active_blocks == 1)
+        return true;
     bool arrived_last = false;
     if (threadIdx.x == 0) {
         arrived_last = ptx::atom_add_acq_rel_gpu(grid_barrier_ptr, 1u) + 1 == static_cast<unsigned>(num_active_blocks);

@@ -87,8 +87,14 @@ adaptive_dispatch_impl(
     const auto topo = topology::load(topology_ptr);
     const auto sm_idx = static_cast<int>(blockIdx.x), thread_idx = static_cast<int>(threadIdx.x);
 
-    // Surplus blocks of the fixed grid release their SM at once (before any barrier or mbarrier init)
-    if (sm_idx >= topo.num_active_sms)
+    const auto direct_roles = comm::direct_peer_roles<kNumFFNRanks, kNumMaxScaleupRanks, false>(topo);
+    const bool receive_only = direct_roles.directional() and not direct_roles.sending;
+    // The direct sender's first wave is warp-major, so every token of a batch smaller than the grid
+    // belongs to one of the first num_tokens CTAs. SM 0 still exchanges counts for an empty batch.
+    const int num_dispatch_blocks = direct_roles.directional() ?
+        max(1, min(num_tokens, topo.num_active_sms)) : topo.num_active_sms;
+    // Surplus blocks release their SM before any barrier or mbarrier initialization.
+    if (sm_idx >= num_dispatch_blocks)
         return;
 
     // The transport context comes from the topology descriptor (`EPTopology`), not from the launch
@@ -115,7 +121,6 @@ adaptive_dispatch_impl(
     // numbering and the NVLink peer of a rank is its position `rank % num_scaleup_ranks`. The data warps write straight
     // into the peers' scale-up buffers instead of staging through the scale-out send buffer and the forward warps
     const bool is_direct = topo.mode == topology::kModeDirect;
-    const auto direct_roles = comm::direct_peer_roles<kNumFFNRanks, kNumMaxScaleupRanks, false>(topo);
     const bool zero_local_receive_counts = direct_roles.directional() and direct_roles.sending;
     EP_DEVICE_ASSERT(not is_direct or topo.num_live_scaleout_ranks() == 1);
     const bool zc = kZeroCopy and is_direct;   // zero copy in place; hybrid under `kZeroCopy` = the staged arms
@@ -193,7 +198,20 @@ adaptive_dispatch_impl(
     // of the destination's READY, and the grid's last block exchanges the ARRIVED words at the end. Zero copy skips it: a peer's
     // tagged count row (below) proves it entered this call; nothing is zeroed at entry. Hybrid: the two subteams' barriers
     const bool use_peer_signalling = is_direct and not zc;
-    if (use_peer_signalling) {
+    if (receive_only) {
+        // One warp handles READY and ARRIVED concurrently with the count readers. The receiver never stores
+        // outgoing payloads, so it has no grid arrival or sender counters to reset.
+        if (warp_idx >= kNumNotifyWarps) {
+            if (warp_idx == kNumNotifyWarps) {
+                comm::peer_ready_publish_rt<32, kNumMaxScaleupRanks>(transport, workspace_layout, topo, sm_idx, lane_idx, direct_roles);
+                comm::peer_arrived_exchange_rt<kNumTimeoutCycles, comm::kDirectDispatchTag, kNumMaxScaleupRanks>(
+                    transport, workspace_layout, topo, lane_idx, direct_roles);
+                cudaTriggerProgrammaticLaunchCompletion();
+            }
+            EP_PROFILE_STAMP_LAST(workspace_layout, 7);
+            return;
+        }
+    } else if (use_peer_signalling) {
         comm::peer_ready_publish_rt<kNumThreads, kNumMaxScaleupRanks>(transport, workspace_layout, topo, sm_idx, thread_idx, direct_roles);
     } else if (not zc) {
         comm::gpu_barrier_rt<kNumThreads, kNumTimeoutCycles, comm::kHybridDispatchTag0, kNumMaxScaleupRanks, false, false, true>(
@@ -342,7 +360,7 @@ adaptive_dispatch_impl(
     EP_STATIC_ASSERT(kArrivedExchangeWarpIndex >= kNumNotifyWarps, "The ARRIVED exchange warp must be a data warp");
     bool end_sequence_done = false;
     const auto end_sequence = [&]() {
-        const bool is_last = comm::active_grid_arrive<kNumThreads, kEndBarrierIndex>(workspace_layout.get_active_grid_barrier_ptr(), num_active_sms);
+        const bool is_last = comm::active_grid_arrive<kNumThreads, kEndBarrierIndex>(workspace_layout.get_active_grid_barrier_ptr(), num_dispatch_blocks);
         if (is_last and warp_idx == kArrivedExchangeWarpIndex) {
             // Every block has arrived: no more takes or slot assignments in this launch, so the counters go back to zero
             if (lane_idx == 0)
@@ -582,7 +600,8 @@ adaptive_dispatch_impl(
                     // join it now and continue below while the last block exchanges the ARRIVED words. SM 0's count receive, expert
                     // stats and host words thus follow its data phase; the copy epilogue reads the prefix sums only after
                     // `griddepcontrol.wait`, i.e. after this kernel's full completion, these warps included
-                    end_sequence();
+                    if (not receive_only)
+                        end_sequence();
 
                     // Wait for rank and expert count: `num_scaleup_ranks` rank slots (writer = position `i`), then the
                     // `num_experts` expert slots (writer = the global rank owning expert `i - num_scaleup_ranks`)
@@ -1531,7 +1550,7 @@ adaptive_dispatch_impl(
     // The end: the peer-signalled end sequence, or the end barrier
     EP_PROFILE_STAMP(workspace_layout, 6);
     if (use_peer_signalling) {
-        if (not end_sequence_done)
+        if (not end_sequence_done and not receive_only)
             end_sequence();
         EP_PROFILE_STAMP_LAST(workspace_layout, 7);
         return;
