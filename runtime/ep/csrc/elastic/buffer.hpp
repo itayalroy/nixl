@@ -1044,9 +1044,9 @@ public:
                     throw EPExceptionWithLineInfo("Dispatch CPU wait", get_buffer_info());
             }
         } else {
-            // Without CPU sync, allocate for the worst case of the declared maximum world: every source token of every
-            // rank in every local slot it may select (at most `num_topk`), plus the alignment slack of the fixed local slots
-            num_recv_tokens = num_max_tokens_per_rank * max_num_ranks;
+            // Without CPU sync, reserve one row per potential source token. FFN ranks in a fixed AFD world
+            // always dispatch zero rows, so only the Attention suffix contributes to this bound.
+            num_recv_tokens = num_max_tokens_per_rank * (max_num_ranks - num_ffn_ranks);
             num_expanded_tokens = num_recv_tokens * std::min(num_topk, num_local_experts);
             num_expanded_tokens += (expert_alignment - 1) * num_local_experts;
             num_expanded_tokens = math::align(num_expanded_tokens, expert_alignment);
