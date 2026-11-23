@@ -1621,8 +1621,10 @@ adaptive_dispatch_impl(
     }
     // Scale-up barrier to ensure data arrival
     // As scale-out tokens have already been consumed by forwarders, no need to do scale-out barrier again
-    comm::gpu_barrier_rt<kNumThreads, kNumTimeoutCycles, comm::kHybridDispatchTag1, kNumMaxScaleupRanks, true, true, false>(
-        transport, workspace_layout, topo, sm_idx, thread_idx, /* do not scale-out */ false, true);
+    // Pure Attention ranks have no same-domain dispatch writes. Their receive metadata stays local.
+    if (not is_hybrid_attention)
+        comm::gpu_barrier_rt<kNumThreads, kNumTimeoutCycles, comm::kHybridDispatchTag1, kNumMaxScaleupRanks, true, true, false>(
+            transport, workspace_layout, topo, sm_idx, thread_idx, /* do not scale-out */ false, true);
     EP_PROFILE_STAMP(workspace_layout, 7);
 
     if constexpr (kNumFFNRanks > 0 and kNumMaxScaleoutRanks == 1) {
