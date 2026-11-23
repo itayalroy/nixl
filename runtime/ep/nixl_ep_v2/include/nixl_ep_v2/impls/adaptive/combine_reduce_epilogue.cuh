@@ -35,13 +35,12 @@ namespace nixl_ep_v2::elastic::adaptive {
 
 // Reduce epilogue of the adaptive combine: given the buffer base, it derives the rows to reduce from the topology descriptor (`EPTopology`)
 template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
-          int kNumSMs, int kNumWarps, int kNumChannelsPerSM, int kNumNixlChannels,
+          int kMaxNumWarps, int kNumChannelsPerSM, int kNumNixlChannels,
           int kHidden,
           int kNumExpertsPerRank, int kNumTopk,
           int64_t kNumTimeoutCycles,
-          int kNumThreads = kNumWarps * 32,
           int kNumHiddenBytes = kHidden * sizeof(nv_bfloat16)>
-__global__ void __launch_bounds__(kNumThreads, 1)
+__global__ void __launch_bounds__(kMaxNumWarps * 32, 1)
 combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
                              float* combined_topk_weights,
                              topk_idx_t* combined_topk_idx,
@@ -75,7 +74,9 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x), thread_idx = static_cast<int>(threadIdx.x);
     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
-    const auto global_warp_idx = comm::cross_sm_warp_idx(sm_idx, warp_idx, kNumSMs);   // NOTES: Here we prioritize distributing tasks to different SMs to ensure that the last wave is evenly concentrated on each SM.
+    const int num_blocks = gridDim.x, num_warps = blockDim.x / 32;
+    const int total_warps = num_blocks * num_warps;
+    const auto global_warp_idx = comm::cross_sm_warp_idx(sm_idx, warp_idx, num_blocks);
 
     // Load buffers from scale-out or scale-up ranks
     // The scale-out receive buffer sits right after the scale-up buffer
@@ -91,7 +92,7 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
     // Store buffers
     const auto output_token_layout = layout::TokenLayout(kNumHiddenBytes, 0, 0, false);
     const auto output_buffer = layout::BufferLayout<false>(output_token_layout, 1, num_combined_tokens, combined_x);
-    const auto tma_buffer = layout::BufferLayout<false>(output_token_layout, kNumWarps, 1, smem)
+    const auto tma_buffer = layout::BufferLayout<false>(output_token_layout, num_warps, 1, smem)
         .get_rank_buffer(warp_idx).get_token_buffer(0);
 
     // Bias layout
@@ -158,8 +159,7 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
     constexpr int kNumSmallBatchChunks = kHiddenVec / kSmallBatchChunkVec;
     constexpr int kNumBytesPerSmallBatchChunk = kSmallBatchChunkVec * static_cast<int>(sizeof(combine_vec_t));
     EP_STATIC_ASSERT(kNumSmallBatchChunks * kNumBytesPerSmallBatchChunk == kNumHiddenBytes, "Invalid small-batch chunking");
-    constexpr int kNumMaxSmallBatchTokens = 16;
-    const bool is_small_batch = is_direct and num_combined_tokens <= kNumMaxSmallBatchTokens;
+    const bool is_small_batch = is_direct and num_combined_tokens <= kNumMaxSmallBatchReduceTokens;
     const int num_items_per_token = not is_direct ? 1 :
         is_small_batch ? kNumSmallBatchChunks + (combined_topk_weights != nullptr ? 1 : 0) : kNumChunks;
     const int num_bytes_per_chunk = is_small_batch ? kNumBytesPerSmallBatchChunk : kNumBytesPerChunk;
@@ -285,7 +285,7 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
         // Read from buffers and do reduction
         auto indices = preproc_token_indices;
         int indices_token_idx = preproc_token_idx;
-        for (int item_idx = global_warp_idx; item_idx < num_work_items; item_idx += kNumWarps * kNumSMs) {
+        for (int item_idx = global_warp_idx; item_idx < num_work_items; item_idx += total_warps) {
             const int token_idx = item_token_idx(item_idx);
             if (token_idx != indices_token_idx) {
                 indices = preprocess_token(token_idx);
@@ -305,7 +305,7 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
     // Split each logical forwarding channel's tokens among its epilogue warps.
     // The first token remains global_warp_idx; subsequent tokens stay on the same NIXL channel.
     const int fw_logical_channel = global_warp_idx % num_channels;
-    const int warps_per_fw_channel = 1 + (kNumWarps * kNumSMs - 1 - fw_logical_channel) / num_channels;
+    const int warps_per_fw_channel = 1 + (total_warps - 1 - fw_logical_channel) / num_channels;
     const int token_stride = warps_per_fw_channel * num_channels;
     const auto ctx = nixl::load_context(topo.transport);
     const int rx_nixl_channel = comm::get_nixl_channel_idx(

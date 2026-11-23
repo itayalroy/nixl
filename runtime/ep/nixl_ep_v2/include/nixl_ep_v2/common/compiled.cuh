@@ -100,6 +100,7 @@ union sf_pack_t {
 
 constexpr int kNumTMAAlignedBytes = 16;
 constexpr int kNumAlignedSFPacks = 16 / sizeof(sf_pack_t);
+constexpr int kNumMaxSmallBatchReduceTokens = 16;
 
 // Some communication channel settings
 constexpr int kNumMaxChannels = 1024;

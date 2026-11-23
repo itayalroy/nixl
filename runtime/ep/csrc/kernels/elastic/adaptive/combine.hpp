@@ -160,6 +160,7 @@ public:
         // Templated arguments
         bool use_expanded_layout, allow_multiple_reduction;
         int num_channels_per_sm, num_nixl_channels;
+        int max_num_warps;
         int hidden;
         int num_experts_per_rank, num_topk;
         int64_t num_timeout_cycles;
@@ -188,11 +189,10 @@ public:
 using namespace nixl_ep_v2::elastic::adaptive;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",                        args.use_expanded_layout, args.allow_multiple_reduction,
-                           args.launch_args.grid_dim.first,
-                           args.launch_args.num_threads / 32,
+                           args.max_num_warps,
                            args.num_channels_per_sm, args.num_nixl_channels,
                            args.hidden,
                            args.num_experts_per_rank, args.num_topk,
@@ -235,7 +235,19 @@ static void launch_combine_reduce_epilogue(void* combined_x,
     // Maximize shared memory utilization
     // Too many warps may cause performance degrade, so we limit into 1024
     const auto token_layout = layout::TokenLayout(hidden * sizeof(nv_bfloat16), 0, 0, false);
-    const auto num_warps = std::min<int>(num_smem_bytes / token_layout.get_num_bytes<false>(), 32);
+    const auto bytes_per_warp = token_layout.get_num_bytes<false>();
+    const auto max_num_warps = std::min<int>(num_smem_bytes / bytes_per_warp, 32);
+    auto num_blocks = num_sms, num_warps = max_num_warps, shared_bytes = num_smem_bytes;
+    if (num_combined_tokens <= kNumMaxSmallBatchReduceTokens) {
+        // A direct replay has up to one work item per 512 bytes, plus an optional weight item.
+        // This also covers hybrid replays, where each original token is a single item.
+        const int items_per_token = hidden * static_cast<int>(sizeof(nv_bfloat16)) / 512 +
+            (combined_topk_weights != nullptr);
+        const int num_items = num_combined_tokens * std::max(1, items_per_token);
+        num_blocks = std::min(num_sms, num_items);
+        num_warps = std::min(max_num_warps, math::ceil_div(num_items, num_blocks));
+        shared_bytes = num_warps * bytes_per_warp;
+    }
     const auto num_threads = num_warps * 32;
 
     // Generate, build and launch
@@ -244,6 +256,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
         .allow_multiple_reduction = allow_multiple_reduction,
         .num_channels_per_sm = num_channels_per_sm,
         .num_nixl_channels = num_nixl_channels,
+        .max_num_warps = max_num_warps,
         .hidden = hidden,
         .num_experts_per_rank = num_experts_per_rank, .num_topk = num_topk,
         .num_timeout_cycles = num_timeout_cycles,
@@ -257,7 +270,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
         .topology = topology,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .num_max_scaleup_ranks = num_max_scaleup_ranks,
-        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, true)
+        .launch_args = jit::LaunchArgs(num_blocks, num_threads, shared_bytes, 1, false, true)
     };
     const auto code = CombineReduceEpilogueRuntime::generate(args);
     const auto runtime = jit::compiler->build("adaptive_combine_reduce_epilogue", code);
