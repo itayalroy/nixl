@@ -128,6 +128,7 @@ adaptive_dispatch_impl(
     constexpr int kNumFFNDomains = kNumFFNRanks / kNumMaxScaleupRanks;
     const bool directional_hybrid = kRoleDomains and not is_direct;
     const bool is_hybrid_ffn = directional_hybrid and scaleout_rank_idx < kNumFFNDomains;
+    const bool is_hybrid_attention = directional_hybrid and not is_hybrid_ffn;
     const auto receives_dispatch_from = [=](const int d) {
         return topo.is_scaleout_live(d) and (not directional_hybrid or (is_hybrid_ffn and d >= kNumFFNDomains));
     };
@@ -924,8 +925,11 @@ adaptive_dispatch_impl(
                 const auto total = do_psum(rank_count, psum_num_recv_tokens_per_scaleup_rank, num_scaleup_ranks, 0);
                 for (int i = num_scaleup_ranks + lane_idx; i < kNumMaxScaleupRanks; i += 32)
                     psum_num_recv_tokens_per_scaleup_rank[i] = 0;
-                if (lane_idx == 0)
+                if (lane_idx == 0) {
+                    if (is_hybrid_attention and source_only_channel_linked_list != nullptr)
+                        EP_DEVICE_ASSERT(total == 0 and "expect_no_recv received expert rows");
                     psum_num_recv_tokens_per_scaleup_rank[kNumMaxScaleupRanks] = total;
+                }
             } else if (warp_idx == 1) {
                 // Exclusive prefix sum for later expanding
                 do_psum(expert_count, psum_num_recv_tokens_per_expert, num_experts_per_rank, 1);
@@ -1576,9 +1580,20 @@ adaptive_dispatch_impl(
         #pragma unroll
         for (int i = 0; i < kNumScaleupRanksPerLane; ++ i) {
             if (const auto j = i * 32 + lane_idx; j < num_scaleup_ranks and topology::is_scaleup_live<kNumMaxScaleupRanks>(topo, j)) {
-                const auto dst_ptr = transport.get_p2p_ptr(tail_ptr, scaleup_peer_id(j));
-                EP_DEVICE_ASSERT(dst_ptr != nullptr and "A scale-up peer is not reachable with stores");
-                ptx::st_relaxed_sys(dst_ptr, transform_linked_list_idx(stored_scaleup_send_counters[i]));
+                if (is_hybrid_attention) {
+                    const int list_base = channel_idx * num_tokens_in_linked_list * num_scaleup_ranks + j;
+                    if (source_only_channel_linked_list != nullptr) {
+                        // Close both ends of this empty list. No peer publishes an Attention tail.
+                        source_only_channel_linked_list[list_base] = -1;
+                        source_only_channel_linked_list[list_base + (num_tokens_in_linked_list - 1) * num_scaleup_ranks] = -1;
+                    } else {
+                        *workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, j) = list_base;
+                    }
+                } else {
+                    const auto dst_ptr = transport.get_p2p_ptr(tail_ptr, scaleup_peer_id(j));
+                    EP_DEVICE_ASSERT(dst_ptr != nullptr and "A scale-up peer is not reachable with stores");
+                    ptx::st_relaxed_sys(dst_ptr, transform_linked_list_idx(stored_scaleup_send_counters[i]));
+                }
             }
         }
         __syncwarp();

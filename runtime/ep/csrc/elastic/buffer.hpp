@@ -953,9 +953,10 @@ public:
             zc_count_matrix_ptr = reinterpret_cast<int*>(zc.base + zc.count_matrix_offset);
         }
 
-        // AFD Attention in a single declared domain has no receive copies. The main kernel
-        // finishes its forwarding lists if a test forces hybrid on that domain.
-        const bool fuse_source_copy = num_ffn_ranks > 0 and expect_no_recv and max_num_scaleout_ranks == 1 and
+        // AFD Attention has no receive copies in a single declared domain or in a world
+        // with whole FFN domains. The main kernel also finishes its lists in hybrid mode.
+        const bool fuse_source_copy = num_ffn_ranks > 0 and expect_no_recv and
+                                      (max_num_scaleout_ranks == 1 or num_ffn_ranks % max_num_scaleup_ranks == 0) and
                                       not previous_event_before_epilogue.has_value();
         // Do dispatch into the buffers (with SM limitation)
         EP_HOST_ASSERT(num_sms <= jit::device_runtime->get_num_sms());
