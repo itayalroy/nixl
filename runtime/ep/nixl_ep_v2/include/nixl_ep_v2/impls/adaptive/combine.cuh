@@ -127,6 +127,12 @@ adaptive_combine_impl(nv_bfloat16* x,
         EP_PROFILE_STAMP_LAST(workspace_layout, 15);
         return;
     }
+    // For fewer received tokens than active blocks, the first wave assigns one CTA to each
+    // token. Keep one CTA for signaling an empty batch.
+    const int num_combine_blocks = direct_roles.directional() ?
+        max(1, min(num_reduced_tokens, topo.num_active_sms)) : topo.num_active_sms;
+    if (sm_idx >= num_combine_blocks)
+        return;
 
     // Token layouts
     const auto token_layout = layout::TokenLayout(kNumHiddenBytes, 0, kNumTopk, false);
@@ -374,7 +380,7 @@ adaptive_combine_impl(nv_bfloat16* x,
 
         // End sequence: the block's flush and grid arrival; the last block's first warp zeroes the take counter, exchanges the
         // ARRIVED words and triggers the reduce epilogue
-        const bool is_last = comm::active_grid_arrive<kNumThreads, kEndBarrierIndex>(workspace_layout.get_active_grid_barrier_ptr(), topo.num_active_sms);
+        const bool is_last = comm::active_grid_arrive<kNumThreads, kEndBarrierIndex>(workspace_layout.get_active_grid_barrier_ptr(), num_combine_blocks);
         if (is_last and warp_idx == 0) {
             // Every block has arrived (every take is behind it): the row-chunk take counter back to zero for the next launch
             if (lane_idx == 0)
