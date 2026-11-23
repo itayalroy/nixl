@@ -124,6 +124,9 @@ adaptive_dispatch_impl(
     const bool is_direct = topo.mode == topology::kModeDirect;
     const bool zero_local_receive_counts = direct_roles.directional() and direct_roles.sending;
     EP_DEVICE_ASSERT(not is_direct or topo.num_live_scaleout_ranks() == 1);
+    constexpr bool kRoleDomains = kNumFFNRanks > 0 and kNumFFNRanks % kNumMaxScaleupRanks == 0;
+    constexpr int kNumFFNDomains = kNumFFNRanks / kNumMaxScaleupRanks;
+    const bool directional_hybrid = kRoleDomains and not is_direct;
     const bool zc = kZeroCopy and is_direct;   // zero copy in place; hybrid under `kZeroCopy` = the staged arms
     if constexpr (kZeroCopy)
         EP_DEVICE_ASSERT(zc_recv_x != nullptr and zc_count_matrix != nullptr and "Zero copy needs the arena slot and the count matrix");
@@ -143,7 +146,11 @@ adaptive_dispatch_impl(
     };
     const auto position_of = [=](const int& rank) { return rank % num_scaleup_ranks; };
     // Whether the rank owning a (global) expert is live; a selection of a dead expert is dropped
-    const auto is_expert_owner_live = [=](const int& expert_idx) { return is_rank_live(expert_idx / num_experts_per_rank); };
+    const auto is_expert_owner_live = [=](const int& expert_idx) {
+        const bool live = is_rank_live(expert_idx / num_experts_per_rank);
+        EP_DEVICE_ASSERT(not directional_hybrid or not live or expert_idx / num_experts_per_scaleout < kNumFFNDomains);
+        return live;
+    };
 
     // Workspaces
     const auto workspace_layout = layout::WorkspaceLayout(workspace, num_scaleout_ranks, num_scaleup_ranks, num_experts);

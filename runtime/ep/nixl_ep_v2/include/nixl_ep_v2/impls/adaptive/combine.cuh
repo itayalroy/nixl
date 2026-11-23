@@ -174,6 +174,14 @@ adaptive_combine_impl(nv_bfloat16* x,
     // last block exchanges the ARRIVED words at the end
     if (is_direct) {
         comm::peer_ready_publish_rt<kNumThreads, kNumMaxScaleupRanks>(transport, workspace_layout, topo, sm_idx, thread_idx, direct_roles);
+    } else if constexpr (kNumFFNRanks > 0 and kNumFFNRanks % kNumMaxScaleupRanks == 0) {
+        // Each reply is downstream of its source's dispatch payload, issued after that source replenished its IMM
+        // credits and passed the full dispatch entry barrier. Dispatch and combine stage sends outside the shared
+        // receive arena, and Attention consumes no dispatch rows there. FFN peers still share local scale-up sends
+        // and wait for each other's dispatch epilogues. Attention peers have no local combine rows to exchange.
+        if (scaleout_rank_idx < kNumFFNRanks / kNumMaxScaleupRanks)
+            comm::gpu_barrier_rt<kNumThreads, kNumTimeoutCycles, comm::kHybridCombineTag0, kNumMaxScaleupRanks, false, true, true>(
+                transport, workspace_layout, topo, sm_idx, thread_idx, /* do_scaleout */ false);
     } else {
         comm::gpu_barrier_rt<kNumThreads, kNumTimeoutCycles, comm::kHybridCombineTag0, kNumMaxScaleupRanks, false, true, true>(
             transport, workspace_layout, topo, sm_idx, thread_idx);
