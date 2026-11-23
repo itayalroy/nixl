@@ -75,7 +75,8 @@ adaptive_dispatch_impl(
     int* zc_count_matrix, const int zc_count_row_stride, const int zc_count_matrix_rows,
     const int zc_slot_idx,
     const bool dynamic_take,
-    const int num_max_tokens_per_rank) {
+    const int num_max_tokens_per_rank,
+    int* source_only_channel_linked_list) {
     EP_STATIC_ASSERT(kNumNotifyWarps % 4 == 0, "Invalid warpgroup size");
     EP_STATIC_ASSERT(kNumMaxScaleoutRanks <= topology::kNumMaxScaleoutRanksCap, "Too many scale-out ranks");
     EP_STATIC_ASSERT(kNumMaxScaleupRanks <= topology::kNumMaxScaleupRanksCap, "Too many scale-up ranks");
@@ -88,7 +89,6 @@ adaptive_dispatch_impl(
     const auto sm_idx = static_cast<int>(blockIdx.x), thread_idx = static_cast<int>(threadIdx.x);
 
     const auto direct_roles = comm::direct_peer_roles<kNumFFNRanks, kNumMaxScaleupRanks, false>(topo);
-    const bool receive_only = direct_roles.directional() and not direct_roles.sending;
     // The direct sender's first wave is warp-major, so every token of a batch smaller than the grid
     // belongs to one of the first num_tokens CTAs. SM 0 still exchanges counts for an empty batch.
     const int num_dispatch_blocks = direct_roles.directional() ?
@@ -123,6 +123,14 @@ adaptive_dispatch_impl(
     const bool is_direct = topo.mode == topology::kModeDirect;
     const bool zero_local_receive_counts = direct_roles.directional() and direct_roles.sending;
     EP_DEVICE_ASSERT(not is_direct or topo.num_live_scaleout_ranks() == 1);
+    constexpr bool kRoleDomains = kNumFFNRanks > 0 and kNumFFNRanks % kNumMaxScaleupRanks == 0;
+    constexpr int kNumFFNDomains = kNumFFNRanks / kNumMaxScaleupRanks;
+    const bool directional_hybrid = kRoleDomains and not is_direct;
+    const bool is_hybrid_ffn = directional_hybrid and scaleout_rank_idx < kNumFFNDomains;
+    const bool is_hybrid_attention = directional_hybrid and not is_hybrid_ffn;
+    const auto receives_dispatch_from = [=](const int d) {
+        return topo.is_scaleout_live(d) and (not directional_hybrid or (is_hybrid_ffn and d >= kNumFFNDomains));
+    };
     const bool zc = kZeroCopy and is_direct;   // zero copy in place; hybrid under `kZeroCopy` = the staged arms
     if constexpr (kZeroCopy)
         EP_DEVICE_ASSERT(zc_recv_x != nullptr and zc_count_matrix != nullptr and "Zero copy needs the arena slot and the count matrix");
@@ -142,7 +150,11 @@ adaptive_dispatch_impl(
     };
     const auto position_of = [=](const int& rank) { return rank % num_scaleup_ranks; };
     // Whether the rank owning a (global) expert is live; a selection of a dead expert is dropped
-    const auto is_expert_owner_live = [=](const int& expert_idx) { return is_rank_live(expert_idx / num_experts_per_rank); };
+    const auto is_expert_owner_live = [=](const int& expert_idx) {
+        const bool live = is_rank_live(expert_idx / num_experts_per_rank);
+        EP_DEVICE_ASSERT(not directional_hybrid or not live or expert_idx / num_experts_per_scaleout < kNumFFNDomains);
+        return live;
+    };
 
     // Workspaces
     const auto workspace_layout = layout::WorkspaceLayout(workspace, num_scaleout_ranks, num_scaleup_ranks, num_experts);
@@ -198,21 +210,18 @@ adaptive_dispatch_impl(
     // of the destination's READY, and the grid's last block exchanges the ARRIVED words at the end. Zero copy skips it: a peer's
     // tagged count row (below) proves it entered this call; nothing is zeroed at entry. Hybrid: the two subteams' barriers
     const bool use_peer_signalling = is_direct and not zc;
-    if (receive_only) {
-        // One warp handles READY and ARRIVED concurrently with the count readers. The receiver never stores
-        // outgoing payloads, so it has no grid arrival or sender counters to reset.
-        if (warp_idx >= kNumNotifyWarps) {
-            if (warp_idx == kNumNotifyWarps) {
-                comm::peer_ready_publish_rt<32, kNumMaxScaleupRanks>(transport, workspace_layout, topo, sm_idx, lane_idx, direct_roles);
-                comm::peer_arrived_exchange_rt<kNumTimeoutCycles, comm::kDirectDispatchTag, kNumMaxScaleupRanks>(
-                    transport, workspace_layout, topo, lane_idx, direct_roles);
-                cudaTriggerProgrammaticLaunchCompletion();
-            }
-            EP_PROFILE_STAMP_LAST(workspace_layout, 7);
-            return;
-        }
-    } else if (use_peer_signalling) {
+    if (use_peer_signalling) {
         comm::peer_ready_publish_rt<kNumThreads, kNumMaxScaleupRanks>(transport, workspace_layout, topo, sm_idx, thread_idx, direct_roles);
+    } else if (directional_hybrid) {
+        // FFN publishes rail readiness only after all its warps have returned the prior round's receive credits.
+        // Incoming Attention count rows then prove that each sender acquired this READY before the next dispatch reuses it.
+        if (is_hybrid_ffn) {
+            comm::gpu_barrier_rt<kNumThreads, kNumTimeoutCycles, comm::kHybridDispatchTag0, kNumMaxScaleupRanks, false, true, true, kNumFFNDomains>(
+                transport, workspace_layout, topo, sm_idx, thread_idx);
+        } else {
+            comm::gpu_barrier_rt<kNumThreads, kNumTimeoutCycles, comm::kHybridDispatchTag0, kNumMaxScaleupRanks, false, false, true, kNumFFNDomains>(
+                transport, workspace_layout, topo, sm_idx, thread_idx);
+        }
     } else if (not zc) {
         comm::gpu_barrier_rt<kNumThreads, kNumTimeoutCycles, comm::kHybridDispatchTag0, kNumMaxScaleupRanks, false, false, true>(
             transport, workspace_layout, topo, sm_idx, thread_idx);
@@ -431,13 +440,12 @@ adaptive_dispatch_impl(
         ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
         EP_PROFILE_STAMP(workspace_layout, 8);
 
-        // Do full-grid reduction
-        // Direct (not zero copy): only the SMs that own tokens in the static partition contribute; the others hold all-zero counts.
+        // Only the SMs that own tokens in a staged dispatch contribute; the others hold all-zero counts.
         // The counting loop above gives SM `s` the tokens `s * kNumNotifyWarps + w (mod kNumNotifyWarps * num_active_sms)`, so SM `s`
         // owns a token iff `s < ceil(num_tokens / kNumNotifyWarps)`. When SM 0 is the only contributor its shared counts are the
-        // global counts: no atomics, no wait
-        const int num_contributors = use_peer_signalling ? min(num_active_sms, math::ceil_div(num_tokens, kNumNotifyWarps)) : num_active_sms;
-        const bool local_reduce = use_peer_signalling and num_contributors <= 1;
+        // global counts, including the per-channel counts used by hybrid forwarding.
+        const int num_contributors = zc ? num_active_sms : min(num_active_sms, math::ceil_div(num_tokens, kNumNotifyWarps));
+        const bool local_reduce = not zc and num_contributors <= 1;
         if (not local_reduce and sm_idx < num_contributors) {
             for (int i = thread_idx; i < num_reduction_entries; i += kNumNotifyThreads) {
                 const int64_t counter = (1ll << 32ll) | rank_expert_count[i];
@@ -447,40 +455,41 @@ adaptive_dispatch_impl(
 
         // Do the remaining work by SM 0
         if (sm_idx == 0) {
-            // Reduce all SM's count
-            // Wait all contributing SMs' arrival (every ACTIVE SM unless the direct partition leaves some without tokens)
+            const auto publish_count = [&](const int i, const int count) {
+                const auto encoded = math::encode_decode_positive<int>(count);
+                if (is_direct) {
+                    if constexpr (kZeroCopy) {
+                        rank_expert_count[i] = layout::WorkspaceLayout::zc_make_count_word(
+                            zc_call_tag, zc_slot_idx, false, count);
+                    } else {
+                        rank_expert_count[i] = encoded;
+                    }
+                } else {
+                    // Pack each domain's expert, rank and per-channel counts into its count row.
+                    int d, word;
+                    if (i < num_ranks) {
+                        d = i / num_scaleup_ranks, word = num_experts_per_scaleout + i % num_scaleup_ranks;
+                    } else if (i < num_ranks + num_experts) {
+                        d = (i - num_ranks) / num_experts_per_scaleout, word = (i - num_ranks) % num_experts_per_scaleout;
+                    } else {
+                        const int j = i - num_ranks - num_experts;
+                        d = j % num_scaleout_ranks, word = num_experts_per_scaleout + num_scaleup_ranks + j / num_scaleout_ranks;
+                    }
+                    if (not directional_hybrid or d < kNumFFNDomains)
+                        *scaleout_count_ptr(d, word) = encoded;
+                }
+            };
+
             if (local_reduce) {
-                for (int i = thread_idx; i < num_reduction_entries; i += kNumNotifyThreads)
-                    rank_expert_count[i] = math::encode_decode_positive<int>(rank_expert_count[i]);
+                if (not is_hybrid_ffn)
+                    for (int i = thread_idx; i < num_reduction_entries; i += kNumNotifyThreads)
+                        publish_count(i, rank_expert_count[i]);
             } else {
                 for (int i = thread_idx; i < num_reduction_entries; i += kNumNotifyThreads) {
                     comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
                         const auto status = ptx::ld_volatile<int64_t>(workspace_layout.get_notify_reduction_workspace_ptr() + i);
                         if ((status >> 32) == num_contributors) {
-                            // Encode and write into the send buffer (hybrid) or shared memory (direct)
-                            const auto encoded = math::encode_decode_positive<int>(status & 0xffffffffll);
-                            if (is_direct) {
-                                if constexpr (kZeroCopy) {
-                                    rank_expert_count[i] = layout::WorkspaceLayout::zc_make_count_word(
-                                        zc_call_tag, zc_slot_idx, false, static_cast<int>(status & 0xffffffffll));
-                                } else {
-                                    rank_expert_count[i] = encoded;
-                                }
-                            } else {
-                                // Hybrid: rank count of rank `i`, expert count of expert `i - num_ranks`, or record count of channel `c`
-                                // towards domain `d`, each into its domain's count row
-                                int d, word;
-                                if (i < num_ranks) {
-                                    d = i / num_scaleup_ranks, word = num_experts_per_scaleout + i % num_scaleup_ranks;
-                                } else if (i < num_ranks + num_experts) {
-                                    d = (i - num_ranks) / num_experts_per_scaleout, word = (i - num_ranks) % num_experts_per_scaleout;
-                                } else {
-                                    const int j = i - num_ranks - num_experts;
-                                    d = j % num_scaleout_ranks, word = num_experts_per_scaleout + num_scaleup_ranks + j / num_scaleout_ranks;
-                                }
-                                *scaleout_count_ptr(d, word) = encoded;
-                            }
-
+                            publish_count(i, static_cast<int>(status & 0xffffffffll));
                             // Clean for the next usage
                             workspace_layout.get_notify_reduction_workspace_ptr()[i] = 0;
                             return true;
@@ -600,8 +609,7 @@ adaptive_dispatch_impl(
                     // join it now and continue below while the last block exchanges the ARRIVED words. SM 0's count receive, expert
                     // stats and host words thus follow its data phase; the copy epilogue reads the prefix sums only after
                     // `griddepcontrol.wait`, i.e. after this kernel's full completion, these warps included
-                    if (not receive_only)
-                        end_sequence();
+                    end_sequence();
 
                     // Wait for rank and expert count: `num_scaleup_ranks` rank slots (writer = position `i`), then the
                     // `num_experts` expert slots (writer = the global rank owning expert `i - num_scaleup_ranks`)
@@ -724,7 +732,8 @@ adaptive_dispatch_impl(
                 const int issue_domain = warp_per_domain ? ((thread_idx % 32 == 0) ? thread_idx / 32 : num_scaleout_ranks) : thread_idx;
                 // Profile: the thread issuing to domain 1 (on domain 0) or to domain 0 (elsewhere) stamps its put (slots 18, 19)
                 [[maybe_unused]] const int profile_put_thread = (warp_per_domain ? 32 : 1) * (scaleout_rank_idx == 0 ? 1 : 0);
-                if (issue_domain < num_scaleout_ranks and topo.is_scaleout_live(issue_domain) and issue_domain != scaleout_rank_idx) {
+                if (issue_domain < num_scaleout_ranks and topo.is_scaleout_live(issue_domain) and issue_domain != scaleout_rank_idx and
+                    (not directional_hybrid or (not is_hybrid_ffn and issue_domain < kNumFFNDomains))) {
                     const auto dst_id = scaleout_peer_id(issue_domain);
                     EP_PROFILE_STAMP_THREAD(workspace_layout, 18, profile_put_thread);
                     transport.put_words(
@@ -741,8 +750,8 @@ adaptive_dispatch_impl(
                 const auto recv_and_reduce = [=](const auto& get_ptr_func, const bool& is_expert_reduction = false) -> int {
                     int count = 0;
                     for (int j = 0; j < num_scaleout_ranks; ++ j) {
-                        // Masked domains send nothing
-                        if (not topo.is_scaleout_live(j))
+                        // Role domains exchange counts only from Attention to FFN.
+                        if (not receives_dispatch_from(j))
                             continue;
                         const auto ptr = get_ptr_func(j);
                         int decoded;
@@ -887,8 +896,11 @@ adaptive_dispatch_impl(
                 const auto total = do_psum(rank_count, psum_num_recv_tokens_per_scaleup_rank, num_scaleup_ranks, 0);
                 for (int i = num_scaleup_ranks + lane_idx; i < kNumMaxScaleupRanks; i += 32)
                     psum_num_recv_tokens_per_scaleup_rank[i] = 0;
-                if (lane_idx == 0)
+                if (lane_idx == 0) {
+                    if (is_hybrid_attention and source_only_channel_linked_list != nullptr)
+                        EP_DEVICE_ASSERT(total == 0 and "expect_no_recv received expert rows");
                     psum_num_recv_tokens_per_scaleup_rank[kNumMaxScaleupRanks] = total;
+                }
             } else if (warp_idx == 1) {
                 // Exclusive prefix sum for later expanding
                 do_psum(expert_count, psum_num_recv_tokens_per_expert, num_experts_per_rank, 1);
@@ -1347,7 +1359,7 @@ adaptive_dispatch_impl(
         // only our own domain uses a GPU-local cumulative ready count.
         int num_tokens_processed = 0;
         int stored_scaleup_send_counters[kNumScaleupRanksPerLane] = {};
-        const bool lane_tracks_live_domain = lane_idx < num_scaleout_ranks and topo.is_scaleout_live(lane_idx);
+        const bool lane_tracks_live_domain = lane_idx < num_scaleout_ranks and receives_dispatch_from(lane_idx);
         const auto count_word_ptr = workspace_layout.get_scaleout_expert_count_ptr<false>(
             lane_tracks_live_domain ? lane_idx : 0, num_experts_per_scaleout + num_scaleup_ranks + channel_idx);
         int stored_num_records = lane_tracks_live_domain ? -1 : 0, stored_num_consumed = 0, stored_num_ready = 0;
@@ -1539,9 +1551,20 @@ adaptive_dispatch_impl(
         #pragma unroll
         for (int i = 0; i < kNumScaleupRanksPerLane; ++ i) {
             if (const auto j = i * 32 + lane_idx; j < num_scaleup_ranks and topology::is_scaleup_live<kNumMaxScaleupRanks>(topo, j)) {
-                const auto dst_ptr = transport.get_p2p_ptr(tail_ptr, scaleup_peer_id(j));
-                EP_DEVICE_ASSERT(dst_ptr != nullptr and "A scale-up peer is not reachable with stores");
-                ptx::st_relaxed_sys(dst_ptr, transform_linked_list_idx(stored_scaleup_send_counters[i]));
+                if (is_hybrid_attention) {
+                    const int list_base = channel_idx * num_tokens_in_linked_list * num_scaleup_ranks + j;
+                    if (source_only_channel_linked_list != nullptr) {
+                        // Close both ends of this empty list. No peer publishes an Attention tail.
+                        source_only_channel_linked_list[list_base] = -1;
+                        source_only_channel_linked_list[list_base + (num_tokens_in_linked_list - 1) * num_scaleup_ranks] = -1;
+                    } else {
+                        *workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, j) = list_base;
+                    }
+                } else {
+                    const auto dst_ptr = transport.get_p2p_ptr(tail_ptr, scaleup_peer_id(j));
+                    EP_DEVICE_ASSERT(dst_ptr != nullptr and "A scale-up peer is not reachable with stores");
+                    ptx::st_relaxed_sys(dst_ptr, transform_linked_list_idx(stored_scaleup_send_counters[i]));
+                }
             }
         }
         __syncwarp();
@@ -1550,7 +1573,7 @@ adaptive_dispatch_impl(
     // The end: the peer-signalled end sequence, or the end barrier
     EP_PROFILE_STAMP(workspace_layout, 6);
     if (use_peer_signalling) {
-        if (not end_sequence_done and not receive_only)
+        if (not end_sequence_done)
             end_sequence();
         EP_PROFILE_STAMP_LAST(workspace_layout, 7);
         return;

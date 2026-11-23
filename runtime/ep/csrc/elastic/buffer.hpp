@@ -953,6 +953,11 @@ public:
             zc_count_matrix_ptr = reinterpret_cast<int*>(zc.base + zc.count_matrix_offset);
         }
 
+        // Whole-domain AFD Attention can finish empty forwarding lists in the main kernel.
+        // Use the declared domains so the same launch sequence works across mode changes.
+        const bool fuse_source_copy = num_ffn_ranks > 0 and expect_no_recv and
+                                      num_ffn_ranks % max_num_scaleup_ranks == 0 and
+                                      not previous_event_before_epilogue.has_value();
         // Do dispatch into the buffers (with SM limitation)
         EP_HOST_ASSERT(num_sms <= jit::device_runtime->get_num_sms());
         launch_dispatch(x.data_ptr(), sf_ptr,
@@ -983,6 +988,7 @@ public:
                         zc_count_matrix_ptr, zero_copy ? zc.count_row_stride : 0, zero_copy ? zc.count_matrix_rows : 0,
                         zero_copy ? zero_copy_slot : 0,
                         resolve_dynamic_take(),
+                        fuse_source_copy ? channel_linked_list_ptr : nullptr,
                         comm_stream);
 
         // Received token counters
@@ -1130,25 +1136,30 @@ public:
         stream_control_before_epilogue(previous_event_before_epilogue);
         // Without a CPU sync the count is the worst case: a negative value tells the epilogue to read the fixed slot
         // Zero copy: launched in both modes (a captured graph keeps it across a mode switch); it writes the slot in hybrid mode and returns at once in direct mode
-        launch_dispatch_copy_epilogue(buffer, workspace,
-                                      psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
-                                      psum_num_recv_tokens_per_expert.data_ptr<int>(),
-                                      recv_x.data_ptr(), recv_sf_ptr,
-                                      recv_topk_idx_ptr, recv_topk_weights_ptr,
-                                      recv_src_metadata.data_ptr<int>(),
-                                      channel_linked_list_ptr,
-                                      num_unaligned_recv_tokens_per_expert_ptr,
-                                      expect_no_recv or not do_cpu_sync ? -1 : num_recv_tokens,
-                                      max_num_scaleup_ranks, num_max_tokens_per_rank,
-                                      num_hidden_bytes,
-                                      num_sf_packs, recv_sf_token_stride, recv_sf_hidden_stride,
-                                      num_experts_per_rank, num_topk, expert_alignment,
-                                      get_topology_ptr(),
-                                      jit::device_runtime->get_num_sms(),
-                                      jit::device_runtime->get_num_smem_bytes(),
-                                      num_channels_per_sm,
-                                      do_expand, do_zero_padding, zero_copy,
-                                      comm_stream, expect_no_recv);
+        // Only the Attention suffix originates dispatch rows. A hybrid copy also closes
+        // a linked list per channel, even when the token count is small.
+        const int64_t max_afd_copy_rows = num_ffn_ranks > 0 and not expect_no_recv and max_num_scaleout_ranks == 1 ?
+            static_cast<int64_t>(max_num_ranks - num_ffn_ranks) * num_max_tokens_per_rank : 0;
+        if (not fuse_source_copy)
+            launch_dispatch_copy_epilogue(buffer, workspace,
+                                          psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
+                                          psum_num_recv_tokens_per_expert.data_ptr<int>(),
+                                          recv_x.data_ptr(), recv_sf_ptr,
+                                          recv_topk_idx_ptr, recv_topk_weights_ptr,
+                                          recv_src_metadata.data_ptr<int>(),
+                                          channel_linked_list_ptr,
+                                          num_unaligned_recv_tokens_per_expert_ptr,
+                                          expect_no_recv or not do_cpu_sync ? -1 : num_recv_tokens,
+                                          max_num_scaleup_ranks, num_max_tokens_per_rank,
+                                          num_hidden_bytes,
+                                          num_sf_packs, recv_sf_token_stride, recv_sf_hidden_stride,
+                                          num_experts_per_rank, num_topk, expert_alignment,
+                                          get_topology_ptr(),
+                                          jit::device_runtime->get_num_sms(),
+                                          jit::device_runtime->get_num_smem_bytes(),
+                                          num_channels_per_sm,
+                                          do_expand, do_zero_padding, zero_copy,
+                                          comm_stream, expect_no_recv, max_afd_copy_rows);
 
         // Stream control
         const auto event = stream_control_epilogue(

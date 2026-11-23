@@ -114,19 +114,7 @@ adaptive_combine_impl(nv_bfloat16* x,
         num_reduced_tokens = __ldg(psum_num_recv_tokens_per_scaleup_rank + kNumMaxScaleupRanks);
 
     const auto direct_roles = comm::direct_peer_roles<kNumFFNRanks, kNumMaxScaleupRanks, true>(topo);
-    if (direct_roles.directional() and not direct_roles.sending) {
-        // Attention receives combine output. One warp owns the incoming handshake and no CTA writes payloads.
-        EP_DEVICE_ASSERT(num_reduced_tokens == 0);
-        if (sm_idx == 0 and warp_idx == 0) {
-            const auto transport = nixl::NIXLTransport(ctx, comm::get_nixl_notify_channel_idx());
-            comm::peer_ready_publish_rt<32, kNumMaxScaleupRanks>(transport, workspace_layout, topo, sm_idx, lane_idx, direct_roles);
-            comm::peer_arrived_exchange_rt<kNumTimeoutCycles, comm::kDirectCombineTag, kNumMaxScaleupRanks>(
-                transport, workspace_layout, topo, lane_idx, direct_roles);
-            cudaTriggerProgrammaticLaunchCompletion();
-        }
-        EP_PROFILE_STAMP_LAST(workspace_layout, 15);
-        return;
-    }
+    EP_DEVICE_ASSERT(not direct_roles.directional() or direct_roles.sending or num_reduced_tokens == 0);
     // For fewer received tokens than active blocks, the first wave assigns one CTA to each
     // token. Keep one CTA for signaling an empty batch.
     const int num_combine_blocks = direct_roles.directional() ?
@@ -174,6 +162,14 @@ adaptive_combine_impl(nv_bfloat16* x,
     // last block exchanges the ARRIVED words at the end
     if (is_direct) {
         comm::peer_ready_publish_rt<kNumThreads, kNumMaxScaleupRanks>(transport, workspace_layout, topo, sm_idx, thread_idx, direct_roles);
+    } else if constexpr (kNumFFNRanks > 0 and kNumFFNRanks % kNumMaxScaleupRanks == 0) {
+        // Each reply is downstream of its source's dispatch payload, issued after that source replenished its IMM
+        // credits and passed the full dispatch entry barrier. Dispatch and combine stage sends outside the shared
+        // receive arena, and Attention consumes no dispatch rows there. FFN peers still share local scale-up sends
+        // and wait for each other's dispatch epilogues. Attention peers have no local combine rows to exchange.
+        if (scaleout_rank_idx < kNumFFNRanks / kNumMaxScaleupRanks)
+            comm::gpu_barrier_rt<kNumThreads, kNumTimeoutCycles, comm::kHybridCombineTag0, kNumMaxScaleupRanks, false, true, true>(
+                transport, workspace_layout, topo, sm_idx, thread_idx, /* do_scaleout */ false);
     } else {
         comm::gpu_barrier_rt<kNumThreads, kNumTimeoutCycles, comm::kHybridCombineTag0, kNumMaxScaleupRanks, false, true, true>(
             transport, workspace_layout, topo, sm_idx, thread_idx);
