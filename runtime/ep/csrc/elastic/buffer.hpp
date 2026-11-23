@@ -1135,6 +1135,10 @@ public:
         stream_control_before_epilogue(previous_event_before_epilogue);
         // Without a CPU sync the count is the worst case: a negative value tells the epilogue to read the fixed slot
         // Zero copy: launched in both modes (a captured graph keeps it across a mode switch); it writes the slot in hybrid mode and returns at once in direct mode
+        // Only the Attention suffix originates dispatch rows. Use the declared world so
+        // this bound also holds if a captured graph replays after an active-world change.
+        const int64_t max_afd_copy_rows = num_ffn_ranks > 0 and not expect_no_recv ?
+            static_cast<int64_t>(max_num_ranks - num_ffn_ranks) * num_max_tokens_per_rank : 0;
         if (not fuse_source_copy)
             launch_dispatch_copy_epilogue(buffer, workspace,
                                           psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
@@ -1154,7 +1158,7 @@ public:
                                           jit::device_runtime->get_num_smem_bytes(),
                                           num_channels_per_sm,
                                           do_expand, do_zero_padding, zero_copy,
-                                          comm_stream, expect_no_recv);
+                                          comm_stream, expect_no_recv, max_afd_copy_rows);
 
         // Stream control
         const auto event = stream_control_epilogue(

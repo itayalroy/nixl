@@ -321,17 +321,26 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           const int& num_channels_per_sm,
                                           const bool& do_expand, const bool& do_zero_padding, const bool& zero_copy,
                                           const at::cuda::CUDAStream& stream,
-                                          const bool& expect_no_recv = false) {
+                                          const bool& expect_no_recv = false,
+                                          const int64_t& max_afd_copy_rows = 0) {
     // Maximize shared memory utilization
     // A margin below the opt-in maximum: a layout that filled it to the byte faulted on the last warp's mbarrier
     constexpr int kNumSmemReserveBytes = 1024;
     const auto token_layout = layout::TokenLayout(num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
+    const auto num_staged_bytes_per_warp = token_layout.get_num_bytes<true>();
+    const auto num_full_warps = std::min((num_smem_bytes - kNumSmemReserveBytes) / num_staged_bytes_per_warp, 32);
+    // Bound the small JIT shapes to eight possible grid widths. The copy and hybrid
+    // linked-list loops are grid-stride, including channels with no received rows.
+    constexpr int kMaxSmallAfdCopyRows = 8, kNumSmallAfdCopyWarps = 4;
+    const bool small_afd_copy = 0 < max_afd_copy_rows and max_afd_copy_rows <= kMaxSmallAfdCopyRows and not do_zero_padding;
     // Source-only ranks validate the count and close hybrid forwarding lists without any staging memory.
     const auto num_warps = expect_no_recv ? 4 :
-        std::min((num_smem_bytes - kNumSmemReserveBytes) / token_layout.get_num_bytes<true>(), 32);
+        (small_afd_copy ? std::min(kNumSmallAfdCopyWarps, num_full_warps) : num_full_warps);
     const auto num_threads = num_warps * 32;
-    const auto num_blocks = expect_no_recv ? std::min(4, num_sms) : num_sms;
-    const auto launch_smem_bytes = expect_no_recv ? 0 : num_smem_bytes;
+    const auto num_blocks = expect_no_recv ? std::min(4, num_sms) :
+        (small_afd_copy ? std::min(static_cast<int>(max_afd_copy_rows), num_sms) : num_sms);
+    const auto launch_smem_bytes = expect_no_recv ? 0 :
+        (small_afd_copy ? num_warps * num_staged_bytes_per_warp : num_smem_bytes);
 
     // Generate, build and launch
     const DispatchCopyEpilogueRuntime::Args args = {
