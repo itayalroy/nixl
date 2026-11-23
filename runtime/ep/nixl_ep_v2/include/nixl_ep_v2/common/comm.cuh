@@ -375,11 +375,11 @@ __device__ __forceinline__ bool active_grid_arrive(unsigned* grid_barrier_ptr, c
     return ptx::cta_barrier_or<kNumThreads>(kBarrierIndex, arrived_last);
 }
 
-// The last block's exchange, run by one warp: for every live peer, acquire its READY (it has entered this launch, so our
-// ARRIVED cannot precede its entry) and release our ARRIVED (e + 2); then wait for every peer's ARRIVED and advance the pair's
-// expectation by exactly 2 (this block is the only writer: every other block read the word before arriving).
-// With AFD roles, READY and ARRIVED only go to the partner in the opposite role. Every live pair
-// still advances its epoch, including a same-role pair that may join a later hybrid barrier.
+// The last block's warp exchanges ARRIVED (e + 2) and advances each live pair's expectation by exactly 2.
+// Every other block has read the old expectation before this warp can update it. The symmetric protocol
+// waits for the peer's READY before signaling. AFD signals only the opposite role and each data or count
+// write already acquired READY. With no inbox writes, the monotonic ARRIVED flag can precede receiver entry.
+// Same-role AFD pairs still advance their expectation so they can join a later hybrid barrier.
 template <int64_t kNumTimeoutCycles, int kTag, int kNumMaxScaleupRanks>
 __device__ __forceinline__ void peer_arrived_exchange_rt(const nixl::NIXLTransport& transport, const layout::WorkspaceLayout& workspace,
                                                          const topology::EPTopology& topo, const int& lane_idx,
@@ -394,7 +394,8 @@ __device__ __forceinline__ void peer_arrived_exchange_rt(const nixl::NIXLTranspo
         if (rid < 0 or not roles.sends_to(pos))
             continue;
         const int64_t expected = *workspace.get_peer_barrier_expected_ptr(rid);
-        peer_word_wait_rt<kNumTimeoutCycles, kTag>(workspace, topo, pos, rid, kPeerReadyWord, expected + 1);
+        if (not roles.directional())
+            peer_word_wait_rt<kNumTimeoutCycles, kTag>(workspace, topo, pos, rid, kPeerReadyWord, expected + 1);
         transport.put_word_rel(workspace.get_peer_barrier_signal_ptr(my_rid, kPeerArrivedWord),
                                workspace.get_peer_barrier_staging_ptr(rid, kPeerArrivedWord), expected + 2, rid);
     }
