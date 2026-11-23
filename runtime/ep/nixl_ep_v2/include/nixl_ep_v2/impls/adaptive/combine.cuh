@@ -41,6 +41,7 @@ template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kHidden,
           int kNumExpertsPerRank, int kNumTopk,
           int64_t kNumTimeoutCycles,
+          int kNumFFNRanks = 0,
           int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumMaxScaleupRanks, 32),
           int kNumScaleupUpdateInterval = 3,
           int kNumScaleupWarps = kNumChannelsPerSM,
@@ -112,6 +113,21 @@ adaptive_combine_impl(nv_bfloat16* x,
     if (num_reduced_tokens < 0)
         num_reduced_tokens = __ldg(psum_num_recv_tokens_per_scaleup_rank + kNumMaxScaleupRanks);
 
+    const auto direct_roles = comm::direct_peer_roles<kNumFFNRanks, kNumMaxScaleupRanks, true>(topo);
+    if (direct_roles.directional() and not direct_roles.sending) {
+        // Attention receives combine output. One warp owns the incoming handshake and no CTA writes payloads.
+        EP_DEVICE_ASSERT(num_reduced_tokens == 0);
+        if (sm_idx == 0 and warp_idx == 0) {
+            const auto transport = nixl::NIXLTransport(ctx, comm::get_nixl_notify_channel_idx());
+            comm::peer_ready_publish_rt<32, kNumMaxScaleupRanks>(transport, workspace_layout, topo, sm_idx, lane_idx, direct_roles);
+            comm::peer_arrived_exchange_rt<kNumTimeoutCycles, comm::kDirectCombineTag, kNumMaxScaleupRanks>(
+                transport, workspace_layout, topo, lane_idx, direct_roles);
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
+        EP_PROFILE_STAMP_LAST(workspace_layout, 15);
+        return;
+    }
+
     // Token layouts
     const auto token_layout = layout::TokenLayout(kNumHiddenBytes, 0, kNumTopk, false);
 
@@ -151,7 +167,7 @@ adaptive_combine_impl(nv_bfloat16* x,
     // our READY now, every remote row write below sits behind its writer's acquire of the destination's READY, and the grid's
     // last block exchanges the ARRIVED words at the end
     if (is_direct) {
-        comm::peer_ready_publish_rt<kNumThreads, kNumMaxScaleupRanks>(transport, workspace_layout, topo, sm_idx, thread_idx);
+        comm::peer_ready_publish_rt<kNumThreads, kNumMaxScaleupRanks>(transport, workspace_layout, topo, sm_idx, thread_idx, direct_roles);
     } else {
         comm::gpu_barrier_rt<kNumThreads, kNumTimeoutCycles, comm::kHybridCombineTag0, kNumMaxScaleupRanks, false, true, true>(
             transport, workspace_layout, topo, sm_idx, thread_idx);
@@ -363,7 +379,7 @@ adaptive_combine_impl(nv_bfloat16* x,
             // Every block has arrived (every take is behind it): the row-chunk take counter back to zero for the next launch
             if (lane_idx == 0)
                 *workspace_layout.get_take_counter_ptr(1) = 0u;
-            comm::peer_arrived_exchange_rt<kNumTimeoutCycles, comm::kDirectCombineTag, kNumMaxScaleupRanks>(transport, workspace_layout, topo, lane_idx);
+            comm::peer_arrived_exchange_rt<kNumTimeoutCycles, comm::kDirectCombineTag, kNumMaxScaleupRanks>(transport, workspace_layout, topo, lane_idx, direct_roles);
             // Trigger the reduce epilogue only now: every peer's row has arrived, so no epilogue block parks on an SM while the
             // peers are still writing (the hybrid combine keeps its implicit trigger at kernel exit)
             cudaTriggerProgrammaticLaunchCompletion();

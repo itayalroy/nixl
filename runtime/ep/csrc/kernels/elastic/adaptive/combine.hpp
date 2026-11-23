@@ -39,6 +39,7 @@ public:
         bool use_expanded_layout, allow_multiple_reduction;
         int num_channels_per_sm;
         int num_max_scaleout_ranks, num_max_scaleup_ranks;
+        int num_ffn_ranks;
         int hidden;
         int num_experts_per_rank;
         int num_topk;
@@ -68,7 +69,7 @@ public:
 using namespace nixl_ep_v2::elastic::adaptive;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&adaptive_combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&adaptive_combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",
                            args.use_expanded_layout, args.allow_multiple_reduction,
@@ -78,7 +79,7 @@ static void __instantiate_kernel() {{
                            args.hidden,
                            args.num_experts_per_rank,
                            args.num_topk,
-                           args.num_timeout_cycles);
+                           args.num_timeout_cycles, args.num_ffn_ranks);
     }
 
     static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
@@ -110,6 +111,7 @@ static void launch_combine(void* x,
                            const int& num_experts_per_rank, const int& num_topk,
                            const int64_t& num_timeout_cycles,
                            const int& num_max_scaleout_ranks, const int& num_max_scaleup_ranks,
+                           const int& num_ffn_ranks,
                            const int& num_channels_per_sm,
                            const int& num_smem_bytes,
                            const bool& use_expanded_layout, const bool& allow_multiple_reduction,
@@ -131,6 +133,7 @@ static void launch_combine(void* x,
         .allow_multiple_reduction = allow_multiple_reduction,
         .num_channels_per_sm = num_channels_per_sm,
         .num_max_scaleout_ranks = num_max_scaleout_ranks, .num_max_scaleup_ranks = num_max_scaleup_ranks,
+        .num_ffn_ranks = num_ffn_ranks,
         .hidden = hidden,
         .num_experts_per_rank = num_experts_per_rank,
         .num_topk = num_topk,

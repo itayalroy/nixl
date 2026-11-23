@@ -86,6 +86,7 @@ class ElasticBuffer {
     // Fixed expert slots per rank: the live expert count is the live rank count times this, so a rank's slots
     // (and the expert-indexed handle tensors) keep their size across topology changes
     int num_experts_per_rank = 0;
+    const int num_ffn_ranks;
     // Adaptive kernels: device-side topology descriptor (+ host mirror) and the fixed channel count per SM
     torch::Tensor topology_tensor;
     torch::Tensor completion_usage_tensor;
@@ -127,7 +128,8 @@ public:
                   const int64_t& num_zero_copy_bytes,
                   const int& dynamic_take_mode,
                   const bool& per_buffer_comm_stream = false,
-                  const bool& expect_no_recv = false):
+                  const bool& expect_no_recv = false,
+                  const int& num_ffn_ranks = 0):
         num_buffer_bytes(num_buffer_bytes),
         explicitly_destroy(explicitly_destroy),
         comm_stream(per_buffer_comm_stream ? at::cuda::getStreamFromPool(true) : get_global_comm_stream()),
@@ -136,7 +138,7 @@ public:
         prefer_overlap_with_compute(prefer_overlap_with_compute),
         dynamic_take_mode(dynamic_take_mode),
         max_num_scaleout_ranks(max_num_scaleout_ranks), max_num_scaleup_ranks(max_num_scaleup_ranks), scaleout_rank_idx(scaleout_rank_idx), scaleup_rank_idx(scaleup_rank_idx),
-        num_experts_per_rank(num_experts_per_rank), num_zero_copy_bytes(num_zero_copy_bytes) {
+        num_experts_per_rank(num_experts_per_rank), num_ffn_ranks(num_ffn_ranks), num_zero_copy_bytes(num_zero_copy_bytes) {
         // Check buffer bytes alignment (2 MB)
         EP_HOST_ASSERT(num_buffer_bytes > 0 and num_buffer_bytes % kNumAlignmentBytes == 0);
         EP_HOST_ASSERT(0 <= dynamic_take_mode and dynamic_take_mode <= 2 and "dynamic_take_mode: 0 off, 1 on, 2 automatic");
@@ -166,6 +168,9 @@ public:
         // Create the transport: one symmetric region per rank, registered with this rank's agent
         // Symmetric memory layout: [[Workspace] GPU buffer [zero-copy arena]]
         const int rank_id = topology::rank_id(scaleout_rank_idx, scaleup_rank_idx, max_num_scaleup_ranks);
+        EP_HOST_ASSERT(0 <= num_ffn_ranks and num_ffn_ranks < max_num_scaleout_ranks * max_num_scaleup_ranks and
+                       "The fixed FFN prefix must leave at least one Attention rank");
+        EP_HOST_ASSERT(num_ffn_ranks == 0 or (num_zero_copy_bytes == 0 and expect_no_recv == (rank_id >= num_ffn_ranks)));
         this->nixl_context = std::make_shared<nixl::NIXLEPContext>(
             agent_name_prefix + "_" + std::to_string(rank_id), rank_id, max_num_scaleout_ranks * max_num_scaleup_ranks,
             max_num_scaleup_ranks, num_workspace_bytes + num_buffer_bytes + num_zero_copy_bytes, num_nixl_channels);
@@ -755,6 +760,7 @@ public:
         EP_HOST_ASSERT(x.is_cuda() and x.is_contiguous());
         EP_HOST_ASSERT((x.size(1) * x.element_size()) % sizeof(int4) == 0);
         EP_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
+        EP_HOST_ASSERT(num_ffn_ranks == 0 or expect_no_recv or num_tokens == 0);
 
         // Capacities of the handle tensors: the maximum world, every expert local, the whole launch grid
         const int max_num_ranks = max_num_scaleout_ranks * max_num_scaleup_ranks;
@@ -965,6 +971,7 @@ public:
                         workspace, mapped_host_workspace,
                         get_topology_ptr(),
                         max_num_scaleout_ranks, max_num_scaleup_ranks,
+                        num_ffn_ranks,
                         num_channels_per_sm,
                         num_smem_bytes,
                         num_gpu_timeout_cycles,
@@ -1206,6 +1213,7 @@ public:
 
         // Check tensors at dispatch
         const auto [num_combined_tokens, num_topk] = get_shape<2>(combined_topk_idx);
+        EP_HOST_ASSERT(num_ffn_ranks == 0 or expect_no_recv or num_combined_tokens == 0);
         const auto [num_psum_slots] = get_shape<1>(psum_num_recv_tokens_per_scaleup_rank);
         EP_HOST_ASSERT(combined_topk_idx.is_cuda() and combined_topk_idx.is_contiguous());
         EP_HOST_ASSERT(combined_topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
@@ -1299,6 +1307,7 @@ public:
             hidden, num_experts_per_rank, num_topk,
             num_gpu_timeout_cycles,
             max_num_scaleout_ranks, max_num_scaleup_ranks,
+            num_ffn_ranks,
             *adaptive_num_channels_per_sm,
             jit::device_runtime->get_num_smem_bytes(),
             use_expanded_layout, allow_multiple_reduction,
@@ -1362,6 +1371,7 @@ static void register_apis(pybind11::module_& m) {
     pybind11::class_<ElasticBuffer>(m, "ElasticBuffer")
         .def(pybind11::init<int64_t, bool, bool, int, int, bool, int, int, int, int, int, std::string, int, int64_t, int>())
         .def(pybind11::init<int64_t, bool, bool, int, int, bool, int, int, int, int, int, std::string, int, int64_t, int, bool, bool>())
+        .def(pybind11::init<int64_t, bool, bool, int, int, bool, int, int, int, int, int, std::string, int, int64_t, int, bool, bool, int>())
         .def("destroy", &ElasticBuffer::destroy)
         .def("get_comm_stream", &ElasticBuffer::get_comm_stream)
         .def("get_physical_domain_size", &ElasticBuffer::get_physical_domain_size)

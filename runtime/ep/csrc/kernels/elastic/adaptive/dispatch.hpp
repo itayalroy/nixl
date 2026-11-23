@@ -43,6 +43,7 @@ public:
         bool do_cpu_sync, zero_copy;
         int num_notify_warps, num_channels_per_sm;
         int num_max_scaleout_ranks, num_max_scaleup_ranks;
+        int num_ffn_ranks;
         int num_hidden_bytes, num_sf_packs;
         int num_experts_per_rank, num_topk, expert_alignment;
         int64_t num_timeout_cycles;
@@ -78,7 +79,7 @@ public:
 using namespace nixl_ep_v2::elastic::adaptive;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&adaptive_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&adaptive_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",
             args.do_cpu_sync, args.zero_copy,
@@ -87,7 +88,7 @@ static void __instantiate_kernel() {{
             args.num_max_scaleout_ranks, args.num_max_scaleup_ranks,
             args.num_hidden_bytes, args.num_sf_packs,
             args.num_experts_per_rank, args.num_topk, args.expert_alignment,
-            args.num_timeout_cycles);
+            args.num_timeout_cycles, args.num_ffn_ranks);
     }
 
     static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
@@ -171,6 +172,7 @@ static void launch_dispatch(void* x, void* sf,
                             void* workspace, void* mapped_host_workspace,
                             const topology::EPTopology* topology,
                             const int& num_max_scaleout_ranks, const int& num_max_scaleup_ranks,
+                            const int& num_ffn_ranks,
                             const int& num_channels_per_sm,
                             const int& num_smem_bytes,
                             const int64_t& num_timeout_cycles,
@@ -208,6 +210,7 @@ static void launch_dispatch(void* x, void* sf,
         .do_cpu_sync = do_cpu_sync, .zero_copy = zero_copy,
         .num_notify_warps = kNumNotifyWarps, .num_channels_per_sm = num_channels_per_sm,
         .num_max_scaleout_ranks = num_max_scaleout_ranks, .num_max_scaleup_ranks = num_max_scaleup_ranks,
+        .num_ffn_ranks = num_ffn_ranks,
         .num_hidden_bytes = num_hidden_bytes, .num_sf_packs = num_sf_packs,
         .num_experts_per_rank = num_experts_per_rank, .num_topk = num_topk, .expert_alignment = expert_alignment,
         .num_timeout_cycles = num_timeout_cycles,

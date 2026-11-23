@@ -45,6 +45,7 @@ template <bool kDoCPUSync, bool kZeroCopy,
           int kNumHiddenBytes, int kNumSFPacks,
           int kNumExpertsPerRank, int kNumTopk, int kExpertAlignment,
           int64_t kNumTimeoutCycles,
+          int kNumFFNRanks = 0,
           int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumMaxScaleupRanks, 32),
           int kNumScaleoutWarps = kNumChannelsPerSM,
           int kNumForwardWarps = kNumChannelsPerSM,
@@ -114,6 +115,8 @@ adaptive_dispatch_impl(
     // numbering and the NVLink peer of a rank is its position `rank % num_scaleup_ranks`. The data warps write straight
     // into the peers' scale-up buffers instead of staging through the scale-out send buffer and the forward warps
     const bool is_direct = topo.mode == topology::kModeDirect;
+    const auto direct_roles = comm::direct_peer_roles<kNumFFNRanks, kNumMaxScaleupRanks, false>(topo);
+    const bool zero_local_receive_counts = direct_roles.directional() and direct_roles.sending;
     EP_DEVICE_ASSERT(not is_direct or topo.num_live_scaleout_ranks() == 1);
     const bool zc = kZeroCopy and is_direct;   // zero copy in place; hybrid under `kZeroCopy` = the staged arms
     if constexpr (kZeroCopy)
@@ -191,7 +194,7 @@ adaptive_dispatch_impl(
     // tagged count row (below) proves it entered this call; nothing is zeroed at entry. Hybrid: the two subteams' barriers
     const bool use_peer_signalling = is_direct and not zc;
     if (use_peer_signalling) {
-        comm::peer_ready_publish_rt<kNumThreads, kNumMaxScaleupRanks>(transport, workspace_layout, topo, sm_idx, thread_idx);
+        comm::peer_ready_publish_rt<kNumThreads, kNumMaxScaleupRanks>(transport, workspace_layout, topo, sm_idx, thread_idx, direct_roles);
     } else if (not zc) {
         comm::gpu_barrier_rt<kNumThreads, kNumTimeoutCycles, comm::kHybridDispatchTag0, kNumMaxScaleupRanks, false, false, true>(
             transport, workspace_layout, topo, sm_idx, thread_idx);
@@ -346,7 +349,7 @@ adaptive_dispatch_impl(
                 *workspace_layout.get_take_counter_ptr(0) = 0u;
             for (int pos = lane_idx; pos < num_scaleup_ranks; pos += 32)
                 workspace_layout.get_scaleup_atomic_sender_counter()[pos] = 0;
-            comm::peer_arrived_exchange_rt<kNumTimeoutCycles, comm::kDirectDispatchTag, kNumMaxScaleupRanks>(transport, workspace_layout, topo, lane_idx);
+            comm::peer_arrived_exchange_rt<kNumTimeoutCycles, comm::kDirectDispatchTag, kNumMaxScaleupRanks>(transport, workspace_layout, topo, lane_idx, direct_roles);
             // Trigger the copy epilogue only now: every peer's data has arrived, so no epilogue block parks on an SM while the
             // peers are still writing (every other block has exited, or, when SM 0 is not the last block, SM 0 exits after its
             // count receive; an exit counts as triggered)
@@ -394,6 +397,8 @@ adaptive_dispatch_impl(
 
                 // Rank choice should do deduplication here
                 const auto dst_rank_idx = dst_expert_idx >= 0 ? dst_expert_idx / num_experts_per_rank : -1;
+                if constexpr (kNumFFNRanks > 0)
+                    EP_DEVICE_ASSERT(dst_rank_idx < 0 or direct_roles.sends_to(position_of(dst_rank_idx)));
                 if (ptx::deduplicate(dst_rank_idx, lane_idx) and dst_rank_idx >= 0)
                     atomicAdd_block(rank_count + dst_rank_idx, 1);
 
@@ -530,7 +535,7 @@ adaptive_dispatch_impl(
                         comm::peer_ready_acquire_rt<kNumTimeoutCycles, comm::kDirectDispatchTag, kNumMaxScaleupRanks>(acquired_ready, workspace_layout, topo, pos);
                     };
                     for (int i = thread_idx; i < num_scaleup_ranks; i += kNumNotifyThreads) {
-                        if (not topology::is_scaleup_live<kNumMaxScaleupRanks>(topo, i))
+                        if (not topology::is_scaleup_live<kNumMaxScaleupRanks>(topo, i) or not direct_roles.sends_to(i))
                             continue;
                         acquire_ready(i);
                         const auto dst_rank_counter = workspace_layout.get_scaleup_rank_count_ptr<false>() + scaleup_rank_idx;
@@ -548,7 +553,7 @@ adaptive_dispatch_impl(
                         for (int j = thread_idx; j < num_experts / 2; j += kNumNotifyThreads) {
                             const int i = j * 2;
                             const auto dst_rank = i / num_experts_per_rank;
-                            if (not is_rank_live(dst_rank))
+                            if (not is_rank_live(dst_rank) or not direct_roles.sends_to(position_of(dst_rank)))
                                 continue;
                             const int v0 = expert_count[i], v1 = expert_count[i + 1];
                             const auto idx = num_experts_per_rank * rank_idx + (i % num_experts_per_rank);
@@ -559,7 +564,7 @@ adaptive_dispatch_impl(
                     } else {
                         for (int i = thread_idx; i < num_experts; i += kNumNotifyThreads) {
                             const auto dst_rank = i / num_experts_per_rank;
-                            if (not is_rank_live(dst_rank))
+                            if (not is_rank_live(dst_rank) or not direct_roles.sends_to(position_of(dst_rank)))
                                 continue;
                             const auto idx = num_experts_per_rank * rank_idx + (i % num_experts_per_rank);
                             acquire_ready(position_of(dst_rank));
@@ -582,7 +587,13 @@ adaptive_dispatch_impl(
                     // Wait for rank and expert count: `num_scaleup_ranks` rank slots (writer = position `i`), then the
                     // `num_experts` expert slots (writer = the global rank owning expert `i - num_scaleup_ranks`)
                     const auto start_clock = clock64();
-                    if constexpr (kNumExpertsPerRank % 2 == 0) {
+                    const auto receives_count_from = [&](const int& pos) {
+                        return topology::is_scaleup_live<kNumMaxScaleupRanks>(topo, pos) and direct_roles.receives_from(pos);
+                    };
+                    if (zero_local_receive_counts) {
+                        for (int i = thread_idx; i < num_scaleup_ranks; i += kNumNotifyThreads)
+                            rank_count[i] = 0;
+                    } else if constexpr (kNumExpertsPerRank % 2 == 0) {
                         // Polled in 16-byte chunks of two 64-bit slots: every element is checked on its own (a chunk is retried until
                         // all its live elements read as written; a vector load need not be atomic), then the chunk is zeroed for the next call
                         const int num_rank_chunks = (num_scaleup_ranks + 1) / 2, num_expert_chunks = num_experts / 2;
@@ -596,8 +607,9 @@ adaptive_dispatch_impl(
                             #pragma unroll
                             for (int k = 0; k < 2; ++ k) {
                                 const int e = e0 + k;
-                                live[k] = is_rank_chunk ? (e < num_scaleup_ranks and topology::is_scaleup_live<kNumMaxScaleupRanks>(topo, e))
-                                                        : is_rank_live(e / num_experts_per_rank);
+                                live[k] = is_rank_chunk ? (e < num_scaleup_ranks and receives_count_from(e))
+                                                        : (is_rank_live(e / num_experts_per_rank) and
+                                                           direct_roles.receives_from(position_of(e / num_experts_per_rank)));
                             }
                             int* smem_dst = is_rank_chunk ? rank_count + e0 : expert_count + e0;
                             int decoded[2] = {0, 0};
@@ -630,8 +642,9 @@ adaptive_dispatch_impl(
                         for (int i = thread_idx; i < num_scaleup_ranks + num_experts; i += kNumNotifyThreads) {
                             const bool is_rank_slot = i < num_scaleup_ranks;
                             const int expert_slot = i - num_scaleup_ranks;
-                            const bool live = is_rank_slot ? topology::is_scaleup_live<kNumMaxScaleupRanks>(topo, i)
-                                                           : is_rank_live(expert_slot / num_experts_per_rank);
+                            const bool live = is_rank_slot ? receives_count_from(i)
+                                                           : (is_rank_live(expert_slot / num_experts_per_rank) and
+                                                              direct_roles.receives_from(position_of(expert_slot / num_experts_per_rank)));
                             int* smem_dst = is_rank_slot ? rank_count + i : expert_count + expert_slot;
                             if (not live) {
                                 *smem_dst = 0;
@@ -661,8 +674,9 @@ adaptive_dispatch_impl(
                 // Reduce expert count and add stats
                 for (int i = thread_idx; i < num_experts_per_rank; i += kNumNotifyThreads) {
                     int sum = 0;
-                    for (int j = 0; j < num_ranks; ++ j)
-                        sum += expert_count[j * num_experts_per_rank + i];
+                    if (not zero_local_receive_counts)
+                        for (int j = 0; j < num_ranks; ++ j)
+                            sum += expert_count[j * num_experts_per_rank + i];
 
                     // Write unaligned count before aligning
                     if (num_unaligned_recv_tokens_per_expert != nullptr)

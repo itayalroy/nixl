@@ -241,6 +241,34 @@ __device__ __forceinline__ void peer_barrier_leg_rt(const nixl::NIXLTransport& t
 // ODR-uses a variable (undefined in device code) but only materialises a temporary from an enumerator
 enum PeerWord : int { kPeerReadyWord = 0, kPeerArrivedWord = 1 };
 
+// A fixed FFN prefix of the maximum world identifies the two ends of an AFD transfer.
+// The local boundary uses declared positions, including when the live world is a subset.
+struct DirectPeerRoles {
+    int ffn_end = -1;
+    bool is_ffn = false;
+    bool sending = false;
+
+    __device__ __forceinline__ bool directional() const { return ffn_end >= 0; }
+    __device__ __forceinline__ bool sends_to(int pos) const {
+        return not directional() or (sending and (pos < ffn_end) != is_ffn);
+    }
+    __device__ __forceinline__ bool receives_from(int pos) const {
+        return not directional() or (not sending and (pos < ffn_end) != is_ffn);
+    }
+};
+
+template <int kNumFFNRanks, int kNumMaxScaleupRanks, bool kIsCombine>
+__device__ __forceinline__ DirectPeerRoles direct_peer_roles(const topology::EPTopology& topo) {
+    if constexpr (kNumFFNRanks > 0) {
+        if (topo.mode == topology::kModeDirect) {
+            const int ffn_end = max(0, kNumFFNRanks - topo.scaleout_rank_idx * kNumMaxScaleupRanks);
+            const bool is_ffn = topo.scaleup_rank_idx < ffn_end;
+            return {ffn_end, is_ffn, kIsCombine == is_ffn};
+        }
+    }
+    return {};
+}
+
 // Wait (acquire) until peer `rid` at position `pos` has written at least `threshold` into our copy of its `word`
 template <int64_t kNumTimeoutCycles, int kTag>
 __device__ __forceinline__ void peer_word_wait_rt(const layout::WorkspaceLayout& workspace, const topology::EPTopology& topo,
@@ -264,12 +292,14 @@ __device__ __forceinline__ void peer_word_wait_rt(const layout::WorkspaceLayout&
 // SM 0's thread `pos` publishes our READY (e + 1) to live peer position `pos`
 template <int kNumThreads, int kNumMaxScaleupRanks>
 __device__ __forceinline__ void peer_ready_publish_rt(const nixl::NIXLTransport& transport, const layout::WorkspaceLayout& workspace,
-                                                      const topology::EPTopology& topo, const int& sm_idx, const int& thread_idx) {
+                                                      const topology::EPTopology& topo, const int& sm_idx, const int& thread_idx,
+                                                      const DirectPeerRoles& roles = {}) {
     if (sm_idx > 0)
         return;
     const int my_rid = topology::rank_id(topo.scaleout_rank_idx, topo.scaleup_rank_idx, kNumMaxScaleupRanks);
     for (int pos = thread_idx; pos < topo.num_scaleup_ranks; pos += kNumThreads) {
-        if (pos == topo.scaleup_rank_idx or not topology::is_scaleup_live<kNumMaxScaleupRanks>(topo, pos))
+        if (pos == topo.scaleup_rank_idx or not topology::is_scaleup_live<kNumMaxScaleupRanks>(topo, pos) or
+            not roles.receives_from(pos))
             continue;
         const int rid = topology::rank_id(topo.scaleout_rank_idx, pos, kNumMaxScaleupRanks);
         transport.put_word_rel(workspace.get_peer_barrier_signal_ptr(my_rid, kPeerReadyWord),
@@ -332,10 +362,13 @@ __device__ __forceinline__ bool active_grid_arrive(unsigned* grid_barrier_ptr, c
 
 // The last block's exchange, run by one warp: for every live peer, acquire its READY (it has entered this launch, so our
 // ARRIVED cannot precede its entry) and release our ARRIVED (e + 2); then wait for every peer's ARRIVED and advance the pair's
-// expectation by exactly 2 (this block is the only writer: every other block read the word before arriving)
+// expectation by exactly 2 (this block is the only writer: every other block read the word before arriving).
+// With AFD roles, READY and ARRIVED only go to the partner in the opposite role. Every live pair
+// still advances its epoch, including a same-role pair that may join a later hybrid barrier.
 template <int64_t kNumTimeoutCycles, int kTag, int kNumMaxScaleupRanks>
 __device__ __forceinline__ void peer_arrived_exchange_rt(const nixl::NIXLTransport& transport, const layout::WorkspaceLayout& workspace,
-                                                         const topology::EPTopology& topo, const int& lane_idx) {
+                                                         const topology::EPTopology& topo, const int& lane_idx,
+                                                         const DirectPeerRoles& roles = {}) {
     const int my_rid = topology::rank_id(topo.scaleout_rank_idx, topo.scaleup_rank_idx, kNumMaxScaleupRanks);
     const auto live_peer_rid = [&](const int& pos) {   // -1 for our own or a masked position
         return pos == topo.scaleup_rank_idx or not topology::is_scaleup_live<kNumMaxScaleupRanks>(topo, pos) ?
@@ -343,7 +376,7 @@ __device__ __forceinline__ void peer_arrived_exchange_rt(const nixl::NIXLTranspo
     };
     for (int pos = lane_idx; pos < topo.num_scaleup_ranks; pos += 32) {
         const int rid = live_peer_rid(pos);
-        if (rid < 0)
+        if (rid < 0 or not roles.sends_to(pos))
             continue;
         const int64_t expected = *workspace.get_peer_barrier_expected_ptr(rid);
         peer_word_wait_rt<kNumTimeoutCycles, kTag>(workspace, topo, pos, rid, kPeerReadyWord, expected + 1);
@@ -356,7 +389,8 @@ __device__ __forceinline__ void peer_arrived_exchange_rt(const nixl::NIXLTranspo
             continue;
         const auto expected_ptr = workspace.get_peer_barrier_expected_ptr(rid);
         const int64_t expected = *expected_ptr;
-        peer_word_wait_rt<kNumTimeoutCycles, kTag>(workspace, topo, pos, rid, kPeerArrivedWord, expected + 2);
+        if (roles.receives_from(pos))
+            peer_word_wait_rt<kNumTimeoutCycles, kTag>(workspace, topo, pos, rid, kPeerArrivedWord, expected + 2);
         *expected_ptr = expected + 2;
     }
     __syncwarp();

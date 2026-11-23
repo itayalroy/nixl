@@ -350,6 +350,7 @@ class ElasticBuffer:
         dynamic_take: Optional[bool] = False,
         per_buffer_comm_stream: bool = False,
         expect_no_recv: bool = False,
+        num_ffn_ranks: int = 0,
     ):
         """
         Initialize the elastic communication buffer.
@@ -419,9 +420,13 @@ class ElasticBuffer:
             expect_no_recv: this rank never receives expert rows. Dispatch returns zero-row receive tensors and combine
                 accepts zero local expert rows. The GPU checks the receive count on every dispatch, including graph replay.
                 This is fixed for the buffer's lifetime, preserves peer participation, and excludes a zero-copy arena.
+            num_ffn_ranks: fixed AFD layout with FFN ranks in a dense prefix of the declared maximum world.
+                Every peer must declare the same prefix. FFN ranks send zero dispatch source rows, and Attention
+                ranks set `expect_no_recv=True`. Zero keeps the ordinary symmetric protocol.
         """
         assert isinstance(per_buffer_comm_stream, bool)
         assert isinstance(expect_no_recv, bool)
+        assert isinstance(num_ffn_ranks, int) and num_ffn_ranks >= 0
         assert (
             not expect_no_recv or num_zero_copy_slots == 0
         ), "expect_no_recv does not use a zero-copy arena"
@@ -611,6 +616,7 @@ class ElasticBuffer:
             dynamic_take_mode,
             per_buffer_comm_stream,
             expect_no_recv,
+            *((num_ffn_ranks,) if num_ffn_ranks else ()),
         )
 
         if num_zero_copy_slots > 0:
