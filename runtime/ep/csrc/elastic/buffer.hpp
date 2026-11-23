@@ -1136,9 +1136,9 @@ public:
         stream_control_before_epilogue(previous_event_before_epilogue);
         // Without a CPU sync the count is the worst case: a negative value tells the epilogue to read the fixed slot
         // Zero copy: launched in both modes (a captured graph keeps it across a mode switch); it writes the slot in hybrid mode and returns at once in direct mode
-        // Only the Attention suffix originates dispatch rows. Use the declared world so
-        // this bound also holds if a captured graph replays after an active-world change.
-        const int64_t max_afd_copy_rows = num_ffn_ranks > 0 and not expect_no_recv ?
+        // Only the Attention suffix originates dispatch rows. A hybrid copy also closes
+        // a linked list per channel, even when the token count is small.
+        const int64_t max_afd_copy_rows = num_ffn_ranks > 0 and not expect_no_recv and max_num_scaleout_ranks == 1 ?
             static_cast<int64_t>(max_num_ranks - num_ffn_ranks) * num_max_tokens_per_rank : 0;
         if (not fuse_source_copy)
             launch_dispatch_copy_epilogue(buffer, workspace,
