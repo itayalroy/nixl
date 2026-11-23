@@ -127,6 +127,10 @@ adaptive_dispatch_impl(
     constexpr bool kRoleDomains = kNumFFNRanks > 0 and kNumFFNRanks % kNumMaxScaleupRanks == 0;
     constexpr int kNumFFNDomains = kNumFFNRanks / kNumMaxScaleupRanks;
     const bool directional_hybrid = kRoleDomains and not is_direct;
+    const bool is_hybrid_ffn = directional_hybrid and scaleout_rank_idx < kNumFFNDomains;
+    const auto receives_dispatch_from = [=](const int d) {
+        return topo.is_scaleout_live(d) and (not directional_hybrid or (is_hybrid_ffn and d >= kNumFFNDomains));
+    };
     const bool zc = kZeroCopy and is_direct;   // zero copy in place; hybrid under `kZeroCopy` = the staged arms
     if constexpr (kZeroCopy)
         EP_DEVICE_ASSERT(zc_recv_x != nullptr and zc_count_matrix != nullptr and "Zero copy needs the arena slot and the count matrix");
@@ -485,11 +489,12 @@ adaptive_dispatch_impl(
                         const int j = i - num_ranks - num_experts;
                         d = j % num_scaleout_ranks, word = num_experts_per_scaleout + num_scaleup_ranks + j / num_scaleout_ranks;
                     }
-                    *scaleout_count_ptr(d, word) = encoded;
+                    if (not directional_hybrid or d < kNumFFNDomains)
+                        *scaleout_count_ptr(d, word) = encoded;
                 }
             };
 
-            if (local_reduce and not receive_only) {
+            if (local_reduce and not receive_only and not is_hybrid_ffn) {
                 for (int i = thread_idx; i < num_reduction_entries; i += kNumNotifyThreads)
                     publish_count(i, rank_expert_count[i]);
             } else if (not local_reduce) {
@@ -745,7 +750,8 @@ adaptive_dispatch_impl(
                 const int issue_domain = warp_per_domain ? ((thread_idx % 32 == 0) ? thread_idx / 32 : num_scaleout_ranks) : thread_idx;
                 // Profile: the thread issuing to domain 1 (on domain 0) or to domain 0 (elsewhere) stamps its put (slots 18, 19)
                 [[maybe_unused]] const int profile_put_thread = (warp_per_domain ? 32 : 1) * (scaleout_rank_idx == 0 ? 1 : 0);
-                if (issue_domain < num_scaleout_ranks and topo.is_scaleout_live(issue_domain) and issue_domain != scaleout_rank_idx) {
+                if (issue_domain < num_scaleout_ranks and topo.is_scaleout_live(issue_domain) and issue_domain != scaleout_rank_idx and
+                    (not directional_hybrid or (not is_hybrid_ffn and issue_domain < kNumFFNDomains))) {
                     const auto dst_id = scaleout_peer_id(issue_domain);
                     EP_PROFILE_STAMP_THREAD(workspace_layout, 18, profile_put_thread);
                     transport.put_words(
@@ -762,8 +768,8 @@ adaptive_dispatch_impl(
                 const auto recv_and_reduce = [=](const auto& get_ptr_func, const bool& is_expert_reduction = false) -> int {
                     int count = 0;
                     for (int j = 0; j < num_scaleout_ranks; ++ j) {
-                        // Masked domains send nothing
-                        if (not topo.is_scaleout_live(j))
+                        // Role domains exchange counts only from Attention to FFN.
+                        if (not receives_dispatch_from(j))
                             continue;
                         const auto ptr = get_ptr_func(j);
                         int decoded;
@@ -1368,7 +1374,7 @@ adaptive_dispatch_impl(
         // only our own domain uses a GPU-local cumulative ready count.
         int num_tokens_processed = 0;
         int stored_scaleup_send_counters[kNumScaleupRanksPerLane] = {};
-        const bool lane_tracks_live_domain = lane_idx < num_scaleout_ranks and topo.is_scaleout_live(lane_idx);
+        const bool lane_tracks_live_domain = lane_idx < num_scaleout_ranks and receives_dispatch_from(lane_idx);
         const auto count_word_ptr = workspace_layout.get_scaleout_expert_count_ptr<false>(
             lane_tracks_live_domain ? lane_idx : 0, num_experts_per_scaleout + num_scaleup_ranks + channel_idx);
         int stored_num_records = lane_tracks_live_domain ? -1 : 0, stored_num_consumed = 0, stored_num_ready = 0;
