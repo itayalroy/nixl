@@ -437,13 +437,12 @@ adaptive_dispatch_impl(
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
         EP_PROFILE_STAMP(workspace_layout, 8);
 
-        // Do full-grid reduction
-        // Direct (not zero copy): only the SMs that own tokens in the static partition contribute; the others hold all-zero counts.
+        // Only the SMs that own tokens in a staged dispatch contribute; the others hold all-zero counts.
         // The counting loop above gives SM `s` the tokens `s * kNumNotifyWarps + w (mod kNumNotifyWarps * num_active_sms)`, so SM `s`
         // owns a token iff `s < ceil(num_tokens / kNumNotifyWarps)`. When SM 0 is the only contributor its shared counts are the
-        // global counts: no atomics, no wait
-        const int num_contributors = use_peer_signalling ? min(num_active_sms, math::ceil_div(num_tokens, kNumNotifyWarps)) : num_active_sms;
-        const bool local_reduce = use_peer_signalling and num_contributors <= 1;
+        // global counts, including the per-channel counts used by hybrid forwarding.
+        const int num_contributors = zc ? num_active_sms : min(num_active_sms, math::ceil_div(num_tokens, kNumNotifyWarps));
+        const bool local_reduce = not zc and num_contributors <= 1;
         if (not local_reduce and sm_idx < num_contributors) {
             for (int i = thread_idx; i < num_reduction_entries; i += kNumNotifyThreads) {
                 const int64_t counter = (1ll << 32ll) | rank_expert_count[i];
@@ -459,40 +458,39 @@ adaptive_dispatch_impl(
             const int first_source_expert = first_source_rank * num_experts_per_rank;
             const int num_source_experts = (end_source_rank - first_source_rank) * num_experts_per_rank;
 
-            // Reduce all SM's count
-            // Wait all contributing SMs' arrival (every ACTIVE SM unless the direct partition leaves some without tokens)
+            const auto publish_count = [&](const int i, const int count) {
+                const auto encoded = math::encode_decode_positive<int>(count);
+                if (is_direct) {
+                    if constexpr (kZeroCopy) {
+                        rank_expert_count[i] = layout::WorkspaceLayout::zc_make_count_word(
+                            zc_call_tag, zc_slot_idx, false, count);
+                    } else {
+                        rank_expert_count[i] = encoded;
+                    }
+                } else {
+                    // Pack each domain's expert, rank and per-channel counts into its count row.
+                    int d, word;
+                    if (i < num_ranks) {
+                        d = i / num_scaleup_ranks, word = num_experts_per_scaleout + i % num_scaleup_ranks;
+                    } else if (i < num_ranks + num_experts) {
+                        d = (i - num_ranks) / num_experts_per_scaleout, word = (i - num_ranks) % num_experts_per_scaleout;
+                    } else {
+                        const int j = i - num_ranks - num_experts;
+                        d = j % num_scaleout_ranks, word = num_experts_per_scaleout + num_scaleup_ranks + j / num_scaleout_ranks;
+                    }
+                    *scaleout_count_ptr(d, word) = encoded;
+                }
+            };
+
             if (local_reduce and not receive_only) {
                 for (int i = thread_idx; i < num_reduction_entries; i += kNumNotifyThreads)
-                    rank_expert_count[i] = math::encode_decode_positive<int>(rank_expert_count[i]);
+                    publish_count(i, rank_expert_count[i]);
             } else if (not local_reduce) {
                 for (int i = thread_idx; i < num_reduction_entries; i += kNumNotifyThreads) {
                     comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
                         const auto status = ptx::ld_volatile<int64_t>(workspace_layout.get_notify_reduction_workspace_ptr() + i);
                         if ((status >> 32) == num_contributors) {
-                            // Encode and write into the send buffer (hybrid) or shared memory (direct)
-                            const auto encoded = math::encode_decode_positive<int>(status & 0xffffffffll);
-                            if (is_direct) {
-                                if constexpr (kZeroCopy) {
-                                    rank_expert_count[i] = layout::WorkspaceLayout::zc_make_count_word(
-                                        zc_call_tag, zc_slot_idx, false, static_cast<int>(status & 0xffffffffll));
-                                } else {
-                                    rank_expert_count[i] = encoded;
-                                }
-                            } else {
-                                // Hybrid: rank count of rank `i`, expert count of expert `i - num_ranks`, or record count of channel `c`
-                                // towards domain `d`, each into its domain's count row
-                                int d, word;
-                                if (i < num_ranks) {
-                                    d = i / num_scaleup_ranks, word = num_experts_per_scaleout + i % num_scaleup_ranks;
-                                } else if (i < num_ranks + num_experts) {
-                                    d = (i - num_ranks) / num_experts_per_scaleout, word = (i - num_ranks) % num_experts_per_scaleout;
-                                } else {
-                                    const int j = i - num_ranks - num_experts;
-                                    d = j % num_scaleout_ranks, word = num_experts_per_scaleout + num_scaleup_ranks + j / num_scaleout_ranks;
-                                }
-                                *scaleout_count_ptr(d, word) = encoded;
-                            }
-
+                            publish_count(i, static_cast<int>(status & 0xffffffffll));
                             // Clean for the next usage
                             workspace_layout.get_notify_reduction_workspace_ptr()[i] = 0;
                             return true;
