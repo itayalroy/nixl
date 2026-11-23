@@ -193,7 +193,7 @@ __device__ __forceinline__ void replenish_cq_rq(const nixl::NIXLTransport& trans
 // One leg of the per-peer barrier, run by one block: thread `t` arrives on peer position `t` of the leg (a scale-up
 // position of our domain, or a domain at our position) by writing our arrival count into the peer's word for us, then
 // waits until our word for the peer reaches the same count. Masked peers are skipped; nothing is reset on a mask change (a connect restarts a pair's words, host side).
-template <int kNumThreads, int64_t kNumTimeoutCycles, int kTag, int kNumMaxScaleupRanks>
+template <int kNumThreads, int64_t kNumTimeoutCycles, int kTag, int kNumMaxScaleupRanks, int kNumFFNDomains = 0>
 __device__ __forceinline__ void peer_barrier_leg_rt(const nixl::NIXLTransport& transport,
                                                     const layout::WorkspaceLayout& workspace,
                                                     const topology::EPTopology& topo,
@@ -216,25 +216,30 @@ __device__ __forceinline__ void peer_barrier_leg_rt(const nixl::NIXLTransport& t
             const int64_t expected = *expected_ptr + 1;
             *expected_ptr = expected;
 
-            // Arrive on the peer with a release write of the count (both sides count the same barriers, see
-            // `put_word_rel`); arrival k uses word and staging slot k % 2 so that two in-flight writes never share a word
+            // The directional dispatch leg publishes FFN receiver readiness to Attention senders only.
+            // Keep the same epoch advance on both endpoints, including pairs that need no signal.
+            const bool local_ffn = topo.scaleout_rank_idx < kNumFFNDomains;
+            const bool peer_ffn = thread_idx < kNumFFNDomains;
             const int parity = static_cast<int>(expected & 1);
-            transport.put_word_rel(workspace.get_peer_barrier_signal_ptr(my_rid, parity),
-                                   workspace.get_peer_barrier_staging_ptr(rid, parity), expected, rid);
+            if (kNumFFNDomains == 0 or (local_ffn and not peer_ffn))
+                transport.put_word_rel(workspace.get_peer_barrier_signal_ptr(my_rid, parity),
+                                       workspace.get_peer_barrier_staging_ptr(rid, parity), expected, rid);
 
             // Wait for the peer's arrival
-            const auto signal_ptr = workspace.get_peer_barrier_signal_ptr(rid, parity);
-            timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
-                const auto signal = ptx::ld_acquire_sys<int64_t>(signal_ptr);
-                if (signal >= expected)
-                    return true;
-                if (is_last_check) {
-                    printf("NIXL EP V2 adaptive peer barrier timeout, tag: %d, leg: %s, scale-out: %d/%d, scale-up: %d/%d, "
-                           "peer position: %d (id %d), signal: %lld, expected: %lld\n", kTag, scaleout_leg ? "scale-out" : "scale-up",
-                           topo.scaleout_rank_idx, topo.num_scaleout_ranks, topo.scaleup_rank_idx, topo.num_scaleup_ranks, thread_idx, rid, static_cast<long long>(signal), static_cast<long long>(expected));
-                }
-                return false;
-            });
+            if (kNumFFNDomains == 0 or (not local_ffn and peer_ffn)) {
+                const auto signal_ptr = workspace.get_peer_barrier_signal_ptr(rid, parity);
+                timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
+                    const auto signal = ptx::ld_acquire_sys<int64_t>(signal_ptr);
+                    if (signal >= expected)
+                        return true;
+                    if (is_last_check) {
+                        printf("NIXL EP V2 adaptive peer barrier timeout, tag: %d, leg: %s, scale-out: %d/%d, scale-up: %d/%d, "
+                               "peer position: %d (id %d), signal: %lld, expected: %lld\n", kTag, scaleout_leg ? "scale-out" : "scale-up",
+                               topo.scaleout_rank_idx, topo.num_scaleout_ranks, topo.scaleup_rank_idx, topo.num_scaleup_ranks, thread_idx, rid, static_cast<long long>(signal), static_cast<long long>(expected));
+                    }
+                    return false;
+                });
+            }
         }
     }
     __syncthreads();
@@ -421,7 +426,7 @@ __device__ __forceinline__ void peer_arrived_exchange_rt(const nixl::NIXLTranspo
 // The adaptive kernels' GPU barrier: scale-up inside the NVLink domain, scale-out over the rail peers, in parallel
 // when both are needed (SM 0 does scale-up, SM 1 does scale-out). Every grid-wide sync counts active blocks only.
 template <int kNumThreads, int64_t kNumTimeoutCycles, int kTag, int kNumMaxScaleupRanks,
-          bool kFlushStores = true, bool kSyncAtStart = true, bool kSyncAtEnd = true>
+          bool kFlushStores = true, bool kSyncAtStart = true, bool kSyncAtEnd = true, int kNumFFNDomains = 0>
 __device__ __forceinline__ void gpu_barrier_rt(const nixl::NIXLTransport& transport,
                                                const layout::WorkspaceLayout& workspace,
                                                const topology::EPTopology& topo,
@@ -456,14 +461,14 @@ __device__ __forceinline__ void gpu_barrier_rt(const nixl::NIXLTransport& transp
             peer_barrier_leg_rt<kNumThreads, kNumTimeoutCycles, kTag, kNumMaxScaleupRanks>(
                 barrier_transport, workspace, topo, false, 0, thread_idx);
         } else {
-            peer_barrier_leg_rt<kNumThreads, kNumTimeoutCycles, kTag, kNumMaxScaleupRanks>(
+            peer_barrier_leg_rt<kNumThreads, kNumTimeoutCycles, kTag, kNumMaxScaleupRanks, kNumFFNDomains>(
                 barrier_transport, workspace, topo, true, sm_idx - 1, thread_idx);
         }
     } else if (do_scaleup) {
         peer_barrier_leg_rt<kNumThreads, kNumTimeoutCycles, kTag, kNumMaxScaleupRanks>(
             barrier_transport, workspace, topo, false, sm_idx, thread_idx);
     } else if (do_scaleout) {
-        peer_barrier_leg_rt<kNumThreads, kNumTimeoutCycles, kTag, kNumMaxScaleupRanks>(
+        peer_barrier_leg_rt<kNumThreads, kNumTimeoutCycles, kTag, kNumMaxScaleupRanks, kNumFFNDomains>(
             barrier_transport, workspace, topo, true, sm_idx, thread_idx);
     }
 

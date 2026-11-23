@@ -225,6 +225,16 @@ adaptive_dispatch_impl(
         }
     } else if (use_peer_signalling) {
         comm::peer_ready_publish_rt<kNumThreads, kNumMaxScaleupRanks>(transport, workspace_layout, topo, sm_idx, thread_idx, direct_roles);
+    } else if (directional_hybrid) {
+        // FFN publishes rail readiness only after all its warps have returned the prior round's receive credits.
+        // Incoming Attention count rows then prove that each sender acquired this READY before the next dispatch reuses it.
+        if (is_hybrid_ffn) {
+            comm::gpu_barrier_rt<kNumThreads, kNumTimeoutCycles, comm::kHybridDispatchTag0, kNumMaxScaleupRanks, false, true, true, kNumFFNDomains>(
+                transport, workspace_layout, topo, sm_idx, thread_idx);
+        } else {
+            comm::gpu_barrier_rt<kNumThreads, kNumTimeoutCycles, comm::kHybridDispatchTag0, kNumMaxScaleupRanks, false, false, true, kNumFFNDomains>(
+                transport, workspace_layout, topo, sm_idx, thread_idx);
+        }
     } else if (not zc) {
         comm::gpu_barrier_rt<kNumThreads, kNumTimeoutCycles, comm::kHybridDispatchTag0, kNumMaxScaleupRanks, false, false, true>(
             transport, workspace_layout, topo, sm_idx, thread_idx);
