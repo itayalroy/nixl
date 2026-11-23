@@ -774,128 +774,140 @@ adaptive_dispatch_impl(
                 __syncwarp();
                 EP_PROFILE_STAMP(workspace_layout, 20);  // notify: warp 0's scale-out count put issued
 
-                // Util functions to get metadata from scale-out peers
-                // NOTES: each count word is polled on its own until it reads as ready: a 4-byte word lands whole (see `put_words`)
-                const auto recv_and_reduce = [=](const auto& get_ptr_func, const bool& is_expert_reduction = false) -> int {
-                    int count = 0;
-                    for (int j = 0; j < num_scaleout_ranks; ++ j) {
-                        // Role domains exchange counts only from Attention to FFN.
-                        if (not receives_dispatch_from(j))
-                            continue;
-                        const auto ptr = get_ptr_func(j);
-                        int decoded;
-                        comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check){
-                            decoded = math::encode_decode_positive(ptx::ld_acquire_sys<int>(ptr));
-                            if (math::is_decoded_positive_ready(decoded))
-                                return true;
-
-                            if (is_last_check) {
-                                printf("NIXL EP V2 adaptive notify (scale-out %s reduction) timeout, "
-                                       "scale-out: %d, scale-up: %d, "
-                                       "thread: %d, wait scale-out: %d, decoded: %d\n",
-                                       is_expert_reduction ? "expert" : "rank",
-                                       scaleout_rank_idx, scaleup_rank_idx, thread_idx, j,
-                                       decoded);
-                            }
-                            return false;
-                        });
-
-                        // Add and clean for next usages
-                        count += decoded, *ptr = 0;
-                    }
-                    return count;
-                };
-
-                // Write into all scale-up peers' rank-level counters
-                for (int i = thread_idx; i < num_scaleup_ranks; i += kNumNotifyThreads) {
-                    // Wait scale-out arrival and reduce (a masked position's words too: the live domains send an encoded zero for it)
-                    const auto count = recv_and_reduce([=](const int& scaleout_peer_idx) {
-                        return workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_peer_idx, num_experts_per_scaleout + i);
-                    });
-                    if (not topology::is_scaleup_live<kNumMaxScaleupRanks>(topo, i))
-                        continue;
-
-                    // Write into the remote scale-up peer
-                    const int64_t counter = (static_cast<int64_t>(num_live_scaleup_ranks) << 32ll) | count;
-                    transport.put_value<int64_t>(
-                        workspace_layout.get_scaleup_rank_count_ptr<false>() + scaleup_rank_idx,
-                        counter, scaleup_peer_id(i));
-                }
-                __syncwarp();
-                EP_PROFILE_STAMP(workspace_layout, 21);  // notify: rank counts received from every domain, forwarded
-
-                // Atomic add into all scale-up peers' expert-level counters
-                for (int i = thread_idx; i < num_experts_per_scaleout; i += kNumNotifyThreads) {
-                    // Wait scale-out arrival and reduce
-                    const auto count = recv_and_reduce([=](const int& scaleout_peer_idx) {
-                        return workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_peer_idx, i);
-                    }, true);
-
-                    // Write into the remote scale-up peer
-                    const auto dst_scaleup_rank_idx = i / num_experts_per_rank;
-                    if (not topology::is_scaleup_live<kNumMaxScaleupRanks>(topo, dst_scaleup_rank_idx))
-                        continue;
-                    const int64_t counter = (1ll << 32ll) | count;
-                    const auto expert_idx_in_dst_rank = i % num_experts_per_rank;
-                    transport.red_add_rel<int64_t>(
-                        workspace_layout.get_scaleup_expert_count_ptr<false>() + expert_idx_in_dst_rank,
-                        counter, scaleup_peer_id(dst_scaleup_rank_idx));
-                }
-                // There are shared memory reads above, a barrier is necessary
-                ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
-                EP_PROFILE_STAMP(workspace_layout, 22);  // notify: expert counts received from every domain, forwarded
-
-                // NOTES: from now on, the `rank` and `expert`s size change into the local size
                 expert_count = rank_expert_count + num_scaleup_ranks;
-
-                // Wait local counters to be ready
-                // NOTES: here we only care the prefix sum by scale-up peers (used for later epilogue), not all ranks
-                // Strided over the notify threads: a small world can have more counters than the notify warps have threads
-                comm::timeout_while_strided<kNumTimeoutCycles>(thread_idx, num_scaleup_ranks + num_experts_per_rank, kNumNotifyThreads,
-                    [&](const int& i, const bool& is_last_check) {
-                    if (i < num_scaleup_ranks and not topology::is_scaleup_live<kNumMaxScaleupRanks>(topo, i)) {
+                if (is_hybrid_attention) {
+                    // No live expert belongs to this Attention domain, so all receive counts are zero.
+                    for (int i = thread_idx; i < num_scaleup_ranks + num_experts_per_rank; i += kNumNotifyThreads) {
                         rank_expert_count[i] = 0;
                         if constexpr (kDoCPUSync)
                             *host_workspace_layout.get_scaleup_count_ptr<false>(i, num_scaleup_ranks) = math::encode_decode_positive(0);
-                        return true;
+                        if (num_unaligned_recv_tokens_per_expert != nullptr and i >= num_scaleup_ranks)
+                            num_unaligned_recv_tokens_per_expert[i - num_scaleup_ranks] = 0;
                     }
-                    const auto slot_ptr = workspace_layout.get_scaleup_count_ptr<false>(i, num_scaleup_ranks);
-                    const auto status = ptx::ld_volatile<int64_t>(slot_ptr);
-                    if ((status >> 32ull) == num_live_scaleup_ranks) {
-                        // Clean GPU workspace and write into host workspace
-                        const auto count = static_cast<int>(status & 0xffffffffll);
-                        const auto aligned_count = math::align<int>(
-                            count, i < num_scaleup_ranks ? 1 : kExpertAlignment);
+                    EP_PROFILE_STAMP(workspace_layout, 21);
+                    ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+                    EP_PROFILE_STAMP(workspace_layout, 22);
+                } else {
+                    // Util functions to get metadata from scale-out peers
+                    // NOTES: each count word is polled on its own until it reads as ready: a 4-byte word lands whole (see `put_words`)
+                    const auto recv_and_reduce = [=](const auto& get_ptr_func, const bool& is_expert_reduction = false) -> int {
+                        int count = 0;
+                        for (int j = 0; j < num_scaleout_ranks; ++ j) {
+                            // Role domains exchange counts only from Attention to FFN.
+                            if (not receives_dispatch_from(j))
+                                continue;
+                            const auto ptr = get_ptr_func(j);
+                            int decoded;
+                            comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check){
+                                decoded = math::encode_decode_positive(ptx::ld_acquire_sys<int>(ptr));
+                                if (math::is_decoded_positive_ready(decoded))
+                                    return true;
 
-                        *slot_ptr = 0;
-                        if constexpr (kDoCPUSync) {
-                            *host_workspace_layout.get_scaleup_count_ptr<false>(i, num_scaleup_ranks) =
-                                math::encode_decode_positive(aligned_count);
+                                if (is_last_check) {
+                                    printf("NIXL EP V2 adaptive notify (scale-out %s reduction) timeout, "
+                                           "scale-out: %d, scale-up: %d, "
+                                           "thread: %d, wait scale-out: %d, decoded: %d\n",
+                                           is_expert_reduction ? "expert" : "rank",
+                                           scaleout_rank_idx, scaleup_rank_idx, thread_idx, j,
+                                           decoded);
+                                }
+                                return false;
+                            });
+
+                            // Add and clean for next usages
+                            count += decoded, *ptr = 0;
+                        }
+                        return count;
+                    };
+
+                    // Write into all scale-up peers' rank-level counters
+                    for (int i = thread_idx; i < num_scaleup_ranks; i += kNumNotifyThreads) {
+                        // Wait scale-out arrival and reduce (a masked position's words too: the live domains send an encoded zero for it)
+                        const auto count = recv_and_reduce([=](const int& scaleout_peer_idx) {
+                            return workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_peer_idx, num_experts_per_scaleout + i);
+                        });
+                        if (not topology::is_scaleup_live<kNumMaxScaleupRanks>(topo, i))
+                            continue;
+
+                        // Write into the remote scale-up peer
+                        const int64_t counter = (static_cast<int64_t>(num_live_scaleup_ranks) << 32ll) | count;
+                        transport.put_value<int64_t>(
+                            workspace_layout.get_scaleup_rank_count_ptr<false>() + scaleup_rank_idx,
+                            counter, scaleup_peer_id(i));
+                    }
+                    __syncwarp();
+                    EP_PROFILE_STAMP(workspace_layout, 21);  // notify: rank counts received from every domain, forwarded
+
+                    // Atomic add into all scale-up peers' expert-level counters
+                    for (int i = thread_idx; i < num_experts_per_scaleout; i += kNumNotifyThreads) {
+                        // Wait scale-out arrival and reduce
+                        const auto count = recv_and_reduce([=](const int& scaleout_peer_idx) {
+                            return workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_peer_idx, i);
+                        }, true);
+
+                        // Write into the remote scale-up peer
+                        const auto dst_scaleup_rank_idx = i / num_experts_per_rank;
+                        if (not topology::is_scaleup_live<kNumMaxScaleupRanks>(topo, dst_scaleup_rank_idx))
+                            continue;
+                        const int64_t counter = (1ll << 32ll) | count;
+                        const auto expert_idx_in_dst_rank = i % num_experts_per_rank;
+                        transport.red_add_rel<int64_t>(
+                            workspace_layout.get_scaleup_expert_count_ptr<false>() + expert_idx_in_dst_rank,
+                            counter, scaleup_peer_id(dst_scaleup_rank_idx));
+                    }
+                    // There are shared memory reads above, a barrier is necessary
+                    ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+                    EP_PROFILE_STAMP(workspace_layout, 22);  // notify: expert counts received from every domain, forwarded
+
+                    // Wait local counters to be ready
+                    // NOTES: here we only care the prefix sum by scale-up peers (used for later epilogue), not all ranks
+                    // Strided over the notify threads: a small world can have more counters than the notify warps have threads
+                    comm::timeout_while_strided<kNumTimeoutCycles>(thread_idx, num_scaleup_ranks + num_experts_per_rank, kNumNotifyThreads,
+                        [&](const int& i, const bool& is_last_check) {
+                        if (i < num_scaleup_ranks and not topology::is_scaleup_live<kNumMaxScaleupRanks>(topo, i)) {
+                            rank_expert_count[i] = 0;
+                            if constexpr (kDoCPUSync)
+                                *host_workspace_layout.get_scaleup_count_ptr<false>(i, num_scaleup_ranks) = math::encode_decode_positive(0);
+                            return true;
+                        }
+                        const auto slot_ptr = workspace_layout.get_scaleup_count_ptr<false>(i, num_scaleup_ranks);
+                        const auto status = ptx::ld_volatile<int64_t>(slot_ptr);
+                        if ((status >> 32ull) == num_live_scaleup_ranks) {
+                            // Clean GPU workspace and write into host workspace
+                            const auto count = static_cast<int>(status & 0xffffffffll);
+                            const auto aligned_count = math::align<int>(
+                                count, i < num_scaleup_ranks ? 1 : kExpertAlignment);
+
+                            *slot_ptr = 0;
+                            if constexpr (kDoCPUSync) {
+                                *host_workspace_layout.get_scaleup_count_ptr<false>(i, num_scaleup_ranks) =
+                                    math::encode_decode_positive(aligned_count);
+                            }
+
+                            // Update statistics counters
+                            if (cumulative_local_expert_recv_stats != nullptr and i >= num_scaleup_ranks)
+                                atomicAdd(cumulative_local_expert_recv_stats + (i - num_scaleup_ranks), count);
+
+                            // Write unaligned count before aligning
+                            if (num_unaligned_recv_tokens_per_expert != nullptr and i >= num_scaleup_ranks)
+                                num_unaligned_recv_tokens_per_expert[i - num_scaleup_ranks] = count;
+
+                            // Save for later prefix sum calculation
+                            rank_expert_count[i] = aligned_count;
+                            return true;
                         }
 
-                        // Update statistics counters
-                        if (cumulative_local_expert_recv_stats != nullptr and i >= num_scaleup_ranks)
-                            atomicAdd(cumulative_local_expert_recv_stats + (i - num_scaleup_ranks), count);
-
-                        // Write unaligned count before aligning
-                        if (num_unaligned_recv_tokens_per_expert != nullptr and i >= num_scaleup_ranks)
-                            num_unaligned_recv_tokens_per_expert[i - num_scaleup_ranks] = count;
-
-                        // Save for later prefix sum calculation
-                        rank_expert_count[i] = aligned_count;
-                        return true;
-                    }
-
-                    if (is_last_check) {
-                        printf("NIXL EP V2 adaptive notify (scale-up reduction) timeout, "
-                               "scale-out: %d/%d, scale-up: %d/%d, "
-                               "slot: %d, status: %d | %d, expected: %d\n",
-                               scaleout_rank_idx, num_scaleout_ranks, scaleup_rank_idx, num_scaleup_ranks, i,
-                               static_cast<int>(status >> 32), static_cast<int>(status & 0xffffffff), num_live_scaleup_ranks);
-                    }
-                    return false;
-                });
-                ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+                        if (is_last_check) {
+                            printf("NIXL EP V2 adaptive notify (scale-up reduction) timeout, "
+                                   "scale-out: %d/%d, scale-up: %d/%d, "
+                                   "slot: %d, status: %d | %d, expected: %d\n",
+                                   scaleout_rank_idx, num_scaleout_ranks, scaleup_rank_idx, num_scaleup_ranks, i,
+                                   static_cast<int>(status >> 32), static_cast<int>(status & 0xffffffff), num_live_scaleup_ranks);
+                        }
+                        return false;
+                    });
+                    ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+                }
             }  // hybrid mode
 
             // Do prefix sum by the warps of the first SM
